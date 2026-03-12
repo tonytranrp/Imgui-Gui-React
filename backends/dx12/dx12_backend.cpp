@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -88,6 +89,7 @@ struct TextAtlasPlacement {
   std::uint32_t atlas_y{};
   std::uint32_t width{};
   std::uint32_t height{};
+  Rect output_rect{};
 };
 
 struct ShaderConstants {
@@ -112,6 +114,28 @@ struct ScopeAccumulator {
   std::uint64_t call_count{};
   std::uint64_t total_microseconds{};
   std::uint64_t max_microseconds{};
+};
+
+using D3D11On12CreateDeviceFn = HRESULT(WINAPI*)(IUnknown*,
+                                                 UINT,
+                                                 const D3D_FEATURE_LEVEL*,
+                                                 UINT,
+                                                 IUnknown* const*,
+                                                 UINT,
+                                                 UINT,
+                                                 ID3D11Device**,
+                                                 ID3D11DeviceContext**,
+                                                 D3D_FEATURE_LEVEL*);
+using D2D1CreateFactoryFn = HRESULT(WINAPI*)(D2D1_FACTORY_TYPE, REFIID, const D2D1_FACTORY_OPTIONS*, void**);
+using DWriteCreateFactoryFn = HRESULT(WINAPI*)(DWRITE_FACTORY_TYPE, REFIID, IUnknown**);
+
+struct Dx12TextInteropApi {
+  HMODULE d3d11_module{};
+  HMODULE d2d1_module{};
+  HMODULE dwrite_module{};
+  D3D11On12CreateDeviceFn create_d3d11on12_device{};
+  D2D1CreateFactoryFn create_d2d1_factory{};
+  DWriteCreateFactoryFn create_dwrite_factory{};
 };
 
 struct OwnedFrameResources {
@@ -291,11 +315,41 @@ std::uint64_t estimate_scene_bytes(const Scene& scene) {
   return static_cast<std::uint64_t>(scene.quads.capacity()) * sizeof(Quad) + static_cast<std::uint64_t>(scene.labels.capacity()) * sizeof(TextLabel);
 }
 
+std::uint32_t bytes_per_pixel(DXGI_FORMAT format) noexcept {
+  switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+      return 4;
+    default:
+      return 0;
+  }
+}
+
 std::uint64_t estimate_d3d12_resource_bytes(ID3D12Resource* resource) {
   if (resource == nullptr) {
     return 0;
   }
-  return static_cast<std::uint64_t>(resource->GetDesc().Width);
+  const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+  if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+    return static_cast<std::uint64_t>(desc.Width);
+  }
+
+  const std::uint32_t bpp = bytes_per_pixel(desc.Format);
+  if (bpp == 0) {
+    return static_cast<std::uint64_t>(desc.Width);
+  }
+
+  std::uint64_t total = 0;
+  std::uint64_t mip_width = desc.Width;
+  std::uint32_t mip_height = desc.Height;
+  for (std::uint16_t mip = 0; mip < (std::max)(desc.MipLevels, static_cast<std::uint16_t>(1)); ++mip) {
+    total += mip_width * static_cast<std::uint64_t>(mip_height) * desc.DepthOrArraySize * bpp;
+    mip_width = (std::max<std::uint64_t>)(1, mip_width >> 1u);
+    mip_height = (std::max<std::uint32_t>)(1, mip_height >> 1u);
+  }
+  return total;
 }
 
 std::uint64_t estimate_bitmap_bytes(std::uint32_t width, std::uint32_t height) {
@@ -323,18 +377,28 @@ void trim_wide_text_cache(StringMap<std::wstring>& cache, const ResourceBudgetCo
   detail::release_storage(cache);
 }
 
+std::size_t retained_capacity_target(std::size_t active_count, std::size_t max_retained, std::size_t minimum_capacity) {
+  if (max_retained == 0) {
+    return 0;
+  }
+  const std::size_t slack_target = active_count + active_count / 2;
+  const std::size_t bounded_target = (std::min)(max_retained, (std::max)(slack_target, minimum_capacity));
+  return (std::max)(active_count, bounded_target);
+}
+
 template <typename T>
-void trim_vector_capacity(std::vector<T>& storage, std::size_t max_retained) {
+void trim_vector_capacity(std::vector<T>& storage, std::size_t max_retained, std::size_t minimum_capacity = 64) {
   if (max_retained == 0) {
     storage.clear();
     detail::release_storage(storage);
     return;
   }
-  if (storage.capacity() <= max_retained * 2) {
+  const std::size_t target_capacity = retained_capacity_target(storage.size(), max_retained, minimum_capacity);
+  if (storage.capacity() <= target_capacity * 2) {
     return;
   }
   std::vector<T> trimmed;
-  trimmed.reserve((std::max)(storage.size(), max_retained));
+  trimmed.reserve(target_capacity);
   for (auto& item : storage) {
     trimmed.push_back(std::move(item));
   }
@@ -345,10 +409,83 @@ void trim_scratch_storage(Scene& scene,
                           std::vector<QuadVertex>& vertices,
                           std::vector<DrawBatch>& batches,
                           const ResourceBudgetConfig& budgets) {
-  trim_vector_capacity(scene.quads, budgets.max_retained_scene_quads);
-  trim_vector_capacity(scene.labels, budgets.max_retained_text_labels);
-  trim_vector_capacity(vertices, budgets.max_retained_vertices);
-  trim_vector_capacity(batches, budgets.max_retained_batches);
+  trim_vector_capacity(scene.quads, budgets.max_retained_scene_quads, 128);
+  trim_vector_capacity(scene.labels, budgets.max_retained_text_labels, 64);
+  trim_vector_capacity(vertices, budgets.max_retained_vertices, 256);
+  trim_vector_capacity(batches, budgets.max_retained_batches, 64);
+}
+
+void trim_upload_buffer(ComPtr<ID3D12Resource>& buffer,
+                        std::byte*& mapped,
+                        std::size_t& capacity,
+                        std::size_t active_count,
+                        std::size_t max_retained,
+                        std::size_t minimum_capacity) {
+  if (!buffer) {
+    return;
+  }
+  if (max_retained == 0) {
+    if (mapped != nullptr) {
+      buffer->Unmap(0, nullptr);
+      mapped = nullptr;
+    }
+    buffer.Reset();
+    capacity = 0;
+    return;
+  }
+  const std::size_t target_capacity = retained_capacity_target(active_count, max_retained, minimum_capacity);
+  if (capacity <= target_capacity * 2) {
+    return;
+  }
+  if (mapped != nullptr) {
+    buffer->Unmap(0, nullptr);
+    mapped = nullptr;
+  }
+  buffer.Reset();
+  capacity = 0;
+}
+
+void fnv1a_append(std::uint64_t& hash, const void* bytes, std::size_t size) noexcept {
+  constexpr std::uint64_t kPrime = 1099511628211ull;
+  const auto* cursor = static_cast<const std::uint8_t*>(bytes);
+  for (std::size_t index = 0; index < size; ++index) {
+    hash ^= cursor[index];
+    hash *= kPrime;
+  }
+}
+
+void fnv1a_append_u32(std::uint64_t& hash, std::uint32_t value) noexcept {
+  fnv1a_append(hash, &value, sizeof(value));
+}
+
+void fnv1a_append_view(std::uint64_t& hash, std::wstring_view view) noexcept {
+  fnv1a_append_u32(hash, static_cast<std::uint32_t>(view.size()));
+  if (!view.empty()) {
+    fnv1a_append(hash, view.data(), view.size() * sizeof(wchar_t));
+  }
+}
+
+void fnv1a_append_view(std::uint64_t& hash, std::string_view view) noexcept {
+  fnv1a_append_u32(hash, static_cast<std::uint32_t>(view.size()));
+  if (!view.empty()) {
+    fnv1a_append(hash, view.data(), view.size());
+  }
+}
+
+std::uint64_t text_atlas_signature(const std::vector<TextAtlasPlacement>& placements) noexcept {
+  std::uint64_t hash = 1469598103934665603ull;
+  for (const auto& placement : placements) {
+    const TextLabel* label = placement.label;
+    if (label == nullptr || label->text == nullptr) {
+      continue;
+    }
+    fnv1a_append_u32(hash, placement.width);
+    fnv1a_append_u32(hash, placement.height);
+    fnv1a_append_u32(hash, static_cast<std::uint32_t>(label->style));
+    fnv1a_append_view(hash, *label->text);
+    fnv1a_append_view(hash, label->font_key);
+  }
+  return hash;
 }
 
 IDXGIAdapter* resolve_dxgi_adapter(ID3D12Device* device,
@@ -1199,6 +1336,9 @@ class Dx12Backend::Impl {
   D3D12_GPU_DESCRIPTOR_HANDLE text_atlas_gpu_descriptor{};
   std::uint32_t text_atlas_width{};
   std::uint32_t text_atlas_height{};
+  std::uint64_t text_atlas_signature{};
+  bool text_atlas_dirty{};
+  std::uint32_t text_atlas_stable_frame_streak{};
   HDC text_bitmap_dc{};
   HBITMAP text_bitmap_handle{};
   HBITMAP text_bitmap_previous{};
@@ -1209,6 +1349,7 @@ class Dx12Backend::Impl {
   ComPtr<ID3D11Device> interop_device;
   ComPtr<ID3D11DeviceContext> interop_context;
   ComPtr<ID3D11On12Device> on12_device;
+  Dx12TextInteropApi text_interop_api{};
   ComPtr<ID2D1Factory3> d2d_factory;
   ComPtr<ID2D1Device2> d2d_device;
   ComPtr<ID2D1DeviceContext2> d2d_context;
@@ -1273,6 +1414,14 @@ void reset_text_bitmap_state(Dx12Backend::Impl& impl) noexcept {
   impl.text_bitmap_height = 0;
 }
 
+void reset_text_atlas_upload_buffer(Dx12Backend::Impl& impl) noexcept;
+
+void release_text_atlas_staging(Dx12Backend::Impl& impl) noexcept {
+  reset_text_bitmap_state(impl);
+  reset_text_atlas_upload_buffer(impl);
+  clear_gdi_fonts(impl);
+}
+
 void reset_text_atlas_resources(Dx12Backend::Impl& impl) noexcept {
   if (impl.text_atlas_upload && impl.text_atlas_upload_mapped != nullptr) {
     impl.text_atlas_upload->Unmap(0, nullptr);
@@ -1329,8 +1478,12 @@ std::uint32_t rgba_row_pitch(std::uint32_t width) noexcept {
 
 void reset_text_atlas_state(Dx12Backend::Impl& impl) noexcept {
   impl.textures.erase(std::string(kInternalTextAtlasKey));
+  release_text_atlas_staging(impl);
   reset_text_atlas_resources(impl);
   impl.scratch_text_placements.clear();
+  impl.text_atlas_signature = 0;
+  impl.text_atlas_dirty = false;
+  impl.text_atlas_stable_frame_streak = 0;
 }
 
 DWRITE_FONT_WEIGHT to_dwrite_weight(FontWeight weight) noexcept {
@@ -1473,7 +1626,82 @@ Status ensure_text_bitmap_surface(Dx12Backend::Impl& impl, std::uint32_t width, 
   return Status::success();
 }
 
-bool pack_text_labels(const std::vector<TextLabel>& labels,
+UINT atlas_draw_flags(const TextLabel& label) noexcept {
+  UINT flags = DT_NOPREFIX | DT_SINGLELINE;
+  switch (label.style) {
+    case TextStyle::title:
+      flags |= DT_LEFT | DT_VCENTER;
+      break;
+    case TextStyle::center:
+      flags |= DT_CENTER | DT_VCENTER;
+      break;
+    case TextStyle::body:
+      flags |= DT_LEFT | DT_TOP;
+      break;
+  }
+  return flags;
+}
+
+TextAtlasPlacement measure_text_label(Dx12Backend::Impl& impl, const Dx12BackendConfig& config, const TextLabel& label) {
+  const auto available_width = static_cast<std::uint32_t>((std::max)(1.0f, std::ceil(label.rect.right - label.rect.left)));
+  const auto available_height = static_cast<std::uint32_t>((std::max)(1.0f, std::ceil(label.rect.bottom - label.rect.top)));
+
+  std::uint32_t measured_width = 1;
+  std::uint32_t measured_height = 1;
+  if (impl.text_bitmap_dc != nullptr && label.text != nullptr && !label.text->empty()) {
+    HFONT font = resolve_gdi_font(impl, config, label);
+    HGDIOBJ previous_font = nullptr;
+    if (font != nullptr) {
+      previous_font = SelectObject(impl.text_bitmap_dc, font);
+    }
+
+    RECT measure_rect{
+        0,
+        0,
+        static_cast<LONG>(available_width),
+        static_cast<LONG>(available_height),
+    };
+    const UINT measure_flags = atlas_draw_flags(label) | DT_CALCRECT;
+    if (DrawTextW(impl.text_bitmap_dc, label.text->c_str(), static_cast<int>(label.text->size()), &measure_rect, measure_flags) > 0) {
+      measured_width = static_cast<std::uint32_t>((std::max)(1L, measure_rect.right - measure_rect.left));
+      measured_height = static_cast<std::uint32_t>((std::max)(1L, measure_rect.bottom - measure_rect.top));
+    }
+
+    if (previous_font != nullptr) {
+      SelectObject(impl.text_bitmap_dc, previous_font);
+    }
+  }
+
+  const std::uint32_t packed_width = (std::max)(1u, (std::min)(available_width, measured_width));
+  const std::uint32_t packed_height = (std::max)(1u, (std::min)(available_height, measured_height));
+
+  float output_left = label.rect.left;
+  float output_top = label.rect.top;
+  const float available_width_f = label.rect.right - label.rect.left;
+  const float available_height_f = label.rect.bottom - label.rect.top;
+  if (label.style == TextStyle::center) {
+    output_left += (std::max)(0.0f, (available_width_f - static_cast<float>(packed_width)) * 0.5f);
+    output_top += (std::max)(0.0f, (available_height_f - static_cast<float>(packed_height)) * 0.5f);
+  } else if (label.style == TextStyle::title) {
+    output_top += (std::max)(0.0f, (available_height_f - static_cast<float>(packed_height)) * 0.5f);
+  }
+
+  return {
+      .label = &label,
+      .atlas_x = 0,
+      .atlas_y = 0,
+      .width = packed_width,
+      .height = packed_height,
+      .output_rect = {
+          .origin = {output_left, output_top},
+          .extent = {static_cast<float>(packed_width), static_cast<float>(packed_height)},
+      },
+  };
+}
+
+bool pack_text_labels(Dx12Backend::Impl& impl,
+                      const Dx12BackendConfig& config,
+                      const std::vector<TextLabel>& labels,
                       std::uint32_t max_dimension,
                       std::uint32_t padding,
                       std::vector<TextAtlasPlacement>& placements,
@@ -1495,28 +1723,23 @@ bool pack_text_labels(const std::vector<TextLabel>& labels,
 
   placements.reserve(labels.size());
   for (const auto& label : labels) {
-    const auto width = static_cast<std::uint32_t>((std::max)(1.0f, std::ceil(label.rect.right - label.rect.left)));
-    const auto height = static_cast<std::uint32_t>((std::max)(1.0f, std::ceil(label.rect.bottom - label.rect.top)));
-    if (width + clamped_padding * 2 > max_size || height + clamped_padding * 2 > max_size) {
+    TextAtlasPlacement placement = measure_text_label(impl, config, label);
+    if (placement.width + clamped_padding * 2 > max_size || placement.height + clamped_padding * 2 > max_size) {
       return false;
     }
-    if (cursor_x + width + clamped_padding > max_size) {
+    if (cursor_x + placement.width + clamped_padding > max_size) {
       cursor_x = clamped_padding;
       cursor_y += row_height + clamped_padding;
       row_height = 0;
     }
-    if (cursor_y + height + clamped_padding > max_size) {
+    if (cursor_y + placement.height + clamped_padding > max_size) {
       return false;
     }
-    placements.push_back({
-        .label = &label,
-        .atlas_x = cursor_x,
-        .atlas_y = cursor_y,
-        .width = width,
-        .height = height,
-    });
-    cursor_x += width + clamped_padding;
-    row_height = (std::max)(row_height, height);
+    placement.atlas_x = cursor_x;
+    placement.atlas_y = cursor_y;
+    placements.push_back(placement);
+    cursor_x += placement.width + clamped_padding;
+    row_height = (std::max)(row_height, placement.height);
     used_width = (std::max)(used_width, cursor_x);
   }
 
@@ -1660,8 +1883,11 @@ Status ensure_text_atlas_upload_buffer(Dx12Backend::Impl& impl) {
 }
 
 Status upload_text_atlas(Dx12Backend::Impl& impl, ID3D12GraphicsCommandList* command_list) {
-  if (command_list == nullptr || impl.text_bitmap_bits == nullptr || impl.text_atlas_width == 0 || impl.text_atlas_height == 0) {
+  if (command_list == nullptr || impl.text_atlas_width == 0 || impl.text_atlas_height == 0 || !impl.text_atlas_dirty) {
     return Status::success();
+  }
+  if (impl.text_bitmap_bits == nullptr) {
+    return Status::not_ready("Dx12Backend text atlas upload requires a populated software text bitmap.");
   }
 
   Status status = ensure_text_atlas_texture(impl, impl.text_bitmap_width, impl.text_bitmap_height);
@@ -1716,6 +1942,8 @@ Status upload_text_atlas(Dx12Backend::Impl& impl, ID3D12GraphicsCommandList* com
   to_sample.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   command_list->ResourceBarrier(1, &to_sample);
   impl.text_atlas_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  impl.text_atlas_dirty = false;
+  impl.text_atlas_stable_frame_streak = 0;
   return Status::success();
 }
 
@@ -1734,67 +1962,73 @@ Status append_text_atlas_quads(Dx12Backend::Impl& impl, const Dx12BackendConfig&
       1u,
       (std::max)(config.text_atlas.padding, static_cast<std::uint32_t>(config.resource_budgets.text_atlas_padding))));
 
-  std::uint32_t atlas_width = 0;
-  std::uint32_t atlas_height = 0;
-  if (!pack_text_labels(impl.scratch_scene.labels, max_dimension, padding, impl.scratch_text_placements, atlas_width, atlas_height)) {
-    return Status::backend_error("Dx12Backend text atlas packing exceeded the configured atlas budget.");
-  }
-
-  Status status = ensure_text_bitmap_surface(impl, atlas_width, atlas_height);
+  Status status = ensure_text_bitmap_surface(impl, 1, 1);
   if (!status) {
     return status;
   }
-  if (impl.text_bitmap_bits == nullptr || impl.text_bitmap_dc == nullptr) {
-    return Status::backend_error("Dx12Backend software text bitmap surface is unavailable.");
+
+  std::uint32_t atlas_width = 0;
+  std::uint32_t atlas_height = 0;
+  if (!pack_text_labels(impl, config, impl.scratch_scene.labels, max_dimension, padding, impl.scratch_text_placements, atlas_width, atlas_height)) {
+    return Status::backend_error("Dx12Backend text atlas packing exceeded the configured atlas budget.");
   }
 
-  std::memset(impl.text_bitmap_bits, 0, estimate_bitmap_bytes(atlas_width, atlas_height));
-  SetBkMode(impl.text_bitmap_dc, TRANSPARENT);
-  SetTextColor(impl.text_bitmap_dc, RGB(255, 255, 255));
-
-  for (const auto& placement : impl.scratch_text_placements) {
-    const TextLabel& label = *placement.label;
-    HFONT font = resolve_gdi_font(impl, config, label);
-    HGDIOBJ previous_font = nullptr;
-    if (font != nullptr) {
-      previous_font = SelectObject(impl.text_bitmap_dc, font);
+  const std::uint64_t atlas_signature = text_atlas_signature(impl.scratch_text_placements);
+  const bool atlas_content_changed =
+      impl.text_atlas_width != atlas_width || impl.text_atlas_height != atlas_height || impl.text_atlas_signature != atlas_signature;
+  if (atlas_content_changed) {
+    status = ensure_text_bitmap_surface(impl, atlas_width, atlas_height);
+    if (!status) {
+      return status;
+    }
+    if (impl.text_bitmap_bits == nullptr || impl.text_bitmap_dc == nullptr) {
+      return Status::backend_error("Dx12Backend software text bitmap surface is unavailable.");
     }
 
-    RECT draw_rect{
-        static_cast<LONG>(placement.atlas_x),
-        static_cast<LONG>(placement.atlas_y),
-        static_cast<LONG>(placement.atlas_x + placement.width),
-        static_cast<LONG>(placement.atlas_y + placement.height),
-    };
-    UINT draw_flags = DT_NOPREFIX | DT_SINGLELINE;
-    switch (label.style) {
-      case TextStyle::title:
-        draw_flags |= DT_LEFT | DT_VCENTER;
-        break;
-      case TextStyle::center:
-        draw_flags |= DT_CENTER | DT_VCENTER;
-        break;
-      case TextStyle::body:
-        draw_flags |= DT_LEFT | DT_TOP;
-        break;
+    std::memset(impl.text_bitmap_bits, 0, estimate_bitmap_bytes(atlas_width, atlas_height));
+    SetBkMode(impl.text_bitmap_dc, TRANSPARENT);
+    SetTextColor(impl.text_bitmap_dc, RGB(255, 255, 255));
+
+    for (const auto& placement : impl.scratch_text_placements) {
+      const TextLabel& label = *placement.label;
+      HFONT font = resolve_gdi_font(impl, config, label);
+      HGDIOBJ previous_font = nullptr;
+      if (font != nullptr) {
+        previous_font = SelectObject(impl.text_bitmap_dc, font);
+      }
+
+      RECT draw_rect{
+          static_cast<LONG>(placement.atlas_x),
+          static_cast<LONG>(placement.atlas_y),
+          static_cast<LONG>(placement.atlas_x + placement.width),
+          static_cast<LONG>(placement.atlas_y + placement.height),
+      };
+      const UINT draw_flags = atlas_draw_flags(label);
+      DrawTextW(impl.text_bitmap_dc, label.text->c_str(), static_cast<int>(label.text->size()), &draw_rect, draw_flags);
+      if (previous_font != nullptr) {
+        SelectObject(impl.text_bitmap_dc, previous_font);
+      }
     }
-    DrawTextW(impl.text_bitmap_dc, label.text->c_str(), static_cast<int>(label.text->size()), &draw_rect, draw_flags);
-    if (previous_font != nullptr) {
-      SelectObject(impl.text_bitmap_dc, previous_font);
-    }
+
+    normalize_text_bitmap_alpha(impl, atlas_width, atlas_height);
+    impl.text_atlas_signature = atlas_signature;
+    impl.text_atlas_dirty = true;
+    impl.text_atlas_stable_frame_streak = 0;
+  } else {
+    impl.text_atlas_dirty = false;
+    impl.text_atlas_stable_frame_streak += 1;
   }
 
-  normalize_text_bitmap_alpha(impl, atlas_width, atlas_height);
   impl.text_atlas_width = atlas_width;
   impl.text_atlas_height = atlas_height;
 
   quads.reserve(quads.size() + impl.scratch_text_placements.size());
   for (const auto& placement : impl.scratch_text_placements) {
     const TextLabel& label = *placement.label;
-    const float left = label.rect.left;
-    const float top = label.rect.top;
-    const float right = label.rect.right;
-    const float bottom = label.rect.bottom;
+    const float left = placement.output_rect.origin.x;
+    const float top = placement.output_rect.origin.y;
+    const float right = placement.output_rect.origin.x + placement.output_rect.extent.x;
+    const float bottom = placement.output_rect.origin.y + placement.output_rect.extent.y;
     quads.push_back({
         .points = {{
             {left, top},
@@ -1937,6 +2171,53 @@ Status wait_for_gpu_idle(Dx12Backend::Impl& impl) {
   return wait_for_fence(impl, fence_value);
 }
 
+void unload_text_interop_api(Dx12TextInteropApi& api) noexcept {
+  api.create_d3d11on12_device = nullptr;
+  api.create_d2d1_factory = nullptr;
+  api.create_dwrite_factory = nullptr;
+  if (api.dwrite_module != nullptr) {
+    FreeLibrary(api.dwrite_module);
+    api.dwrite_module = nullptr;
+  }
+  if (api.d2d1_module != nullptr) {
+    FreeLibrary(api.d2d1_module);
+    api.d2d1_module = nullptr;
+  }
+  if (api.d3d11_module != nullptr) {
+    FreeLibrary(api.d3d11_module);
+    api.d3d11_module = nullptr;
+  }
+}
+
+Status ensure_text_interop_api(Dx12TextInteropApi& api) {
+  auto load_module = [](HMODULE* module, const wchar_t* name) -> bool {
+    if (*module == nullptr) {
+      *module = LoadLibraryW(name);
+    }
+    return *module != nullptr;
+  };
+  auto resolve = [](HMODULE module, const char* name) -> FARPROC {
+    return module != nullptr ? GetProcAddress(module, name) : nullptr;
+  };
+
+  if (!load_module(&api.d3d11_module, L"d3d11.dll") ||
+      !load_module(&api.d2d1_module, L"d2d1.dll") ||
+      !load_module(&api.dwrite_module, L"dwrite.dll")) {
+    unload_text_interop_api(api);
+    return Status::not_ready("Dx12Backend interop text dependencies are unavailable.");
+  }
+
+  api.create_d3d11on12_device = reinterpret_cast<D3D11On12CreateDeviceFn>(resolve(api.d3d11_module, "D3D11On12CreateDevice"));
+  api.create_d2d1_factory = reinterpret_cast<D2D1CreateFactoryFn>(resolve(api.d2d1_module, "D2D1CreateFactory"));
+  api.create_dwrite_factory = reinterpret_cast<DWriteCreateFactoryFn>(resolve(api.dwrite_module, "DWriteCreateFactory"));
+  if (api.create_d3d11on12_device == nullptr || api.create_d2d1_factory == nullptr || api.create_dwrite_factory == nullptr) {
+    unload_text_interop_api(api);
+    return Status::not_ready("Dx12Backend interop text entrypoints could not be resolved.");
+  }
+
+  return Status::success();
+}
+
 void reset_text_interop_state(Dx12Backend::Impl& impl) noexcept {
   if (impl.d2d_context) {
     impl.d2d_context->SetTarget(nullptr);
@@ -1961,6 +2242,7 @@ void reset_text_interop_state(Dx12Backend::Impl& impl) noexcept {
   impl.on12_device.Reset();
   impl.interop_context.Reset();
   impl.interop_device.Reset();
+  unload_text_interop_api(impl.text_interop_api);
   impl.text_interop_available = false;
 }
 
@@ -1995,7 +2277,13 @@ Status Dx12Backend::create_text_interop() {
   const D3D_FEATURE_LEVEL feature_levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
   IUnknown* queues[] = {impl_->queue};
   D3D_FEATURE_LEVEL created_level = D3D_FEATURE_LEVEL_11_0;
-  HRESULT hr = D3D11On12CreateDevice(
+  const Status api_status = ensure_text_interop_api(impl_->text_interop_api);
+  if (!api_status) {
+    impl_->text_interop_available = false;
+    return Status::success();
+  }
+
+  HRESULT hr = impl_->text_interop_api.create_d3d11on12_device(
       impl_->device,
       flags,
       feature_levels,
@@ -2023,7 +2311,11 @@ Status Dx12Backend::create_text_interop() {
     options.debugLevel = D2D1_DEBUG_LEVEL_INFORMATION;
   }
 #endif
-  hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory3), &options, reinterpret_cast<void**>(impl_->d2d_factory.GetAddressOf()));
+  hr = impl_->text_interop_api.create_d2d1_factory(
+      D2D1_FACTORY_TYPE_SINGLE_THREADED,
+      __uuidof(ID2D1Factory3),
+      &options,
+      reinterpret_cast<void**>(impl_->d2d_factory.GetAddressOf()));
   if (FAILED(hr)) {
     impl_->text_interop_available = false;
     return Status::success();
@@ -2049,7 +2341,10 @@ Status Dx12Backend::create_text_interop() {
   impl_->d2d_context->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
   impl_->d2d_context->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
-  hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(impl_->dwrite_factory.GetAddressOf()));
+  hr = impl_->text_interop_api.create_dwrite_factory(
+      DWRITE_FACTORY_TYPE_SHARED,
+      __uuidof(IDWriteFactory),
+      reinterpret_cast<IUnknown**>(impl_->dwrite_factory.GetAddressOf()));
   if (FAILED(hr)) {
     impl_->text_interop_available = false;
     return Status::success();
@@ -3082,6 +3377,23 @@ Status Dx12Backend::render(const FrameDocument& document) {
     last_widget_count_ = document.widget_count();
     trim_wide_text_cache(impl_->wide_text_cache, config_.resource_budgets);
     trim_scratch_storage(impl_->scratch_scene, impl_->scratch_vertices, impl_->scratch_batches, config_.resource_budgets);
+    trim_upload_buffer(impl_->vertex_buffer,
+                       impl_->vertex_buffer_mapped,
+                       impl_->vertex_capacity,
+                       impl_->scratch_vertices.size(),
+                       config_.resource_budgets.max_retained_vertices,
+                       256);
+    trim_upload_buffer(impl_->shader_constant_buffer,
+                       impl_->shader_constant_buffer_mapped,
+                       impl_->shader_constant_capacity,
+                       impl_->stats.shader_batch_count,
+                       config_.resource_budgets.max_retained_shader_constants,
+                       16);
+    if (use_text_atlas && !impl_->text_atlas_dirty &&
+        config_.text_atlas.staging_release_frame_threshold > 0 &&
+        impl_->text_atlas_stable_frame_streak >= config_.text_atlas.staging_release_frame_threshold) {
+      release_text_atlas_staging(*impl_);
+    }
     refresh_telemetry();
     return Status::success();
   }
@@ -3179,6 +3491,23 @@ Status Dx12Backend::render(const FrameDocument& document) {
   }
   trim_wide_text_cache(impl_->wide_text_cache, config_.resource_budgets);
   trim_scratch_storage(impl_->scratch_scene, impl_->scratch_vertices, impl_->scratch_batches, config_.resource_budgets);
+  trim_upload_buffer(impl_->vertex_buffer,
+                     impl_->vertex_buffer_mapped,
+                     impl_->vertex_capacity,
+                     impl_->scratch_vertices.size(),
+                     config_.resource_budgets.max_retained_vertices,
+                     256);
+  trim_upload_buffer(impl_->shader_constant_buffer,
+                     impl_->shader_constant_buffer_mapped,
+                     impl_->shader_constant_capacity,
+                     impl_->stats.shader_batch_count,
+                     config_.resource_budgets.max_retained_shader_constants,
+                     16);
+  if (use_text_atlas && !impl_->text_atlas_dirty &&
+      config_.text_atlas.staging_release_frame_threshold > 0 &&
+      impl_->text_atlas_stable_frame_streak >= config_.text_atlas.staging_release_frame_threshold) {
+    release_text_atlas_staging(*impl_);
+  }
   refresh_telemetry();
   return Status::success();
 }

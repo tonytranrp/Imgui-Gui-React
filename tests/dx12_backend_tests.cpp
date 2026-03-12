@@ -283,6 +283,7 @@ int main() {
 
   igr::backends::Dx12Backend backend({
       .diagnostics = {
+          .enabled = true,
           .memory_sample_interval = 8,
       },
       .resource_budgets = {
@@ -294,9 +295,11 @@ int main() {
       .initial_viewport = {320, 240},
 
       .enable_debug_layer = true,
-
       .enable_vsync = false,
       .text_renderer = igr::backends::Dx12TextRendererMode::atlas,
+      .text_atlas = {
+          .staging_release_frame_threshold = 1,
+      },
 
   });
 
@@ -628,6 +631,52 @@ int main() {
 
   }
 
+  status = backend.render(document);
+
+  if (!status) {
+
+    std::cerr << status.message() << '\n';
+
+    backend.shutdown();
+
+    DestroyWindow(window_handle);
+
+    UnregisterClassW(class_name, instance);
+
+    return fail("DX12 backend steady-state atlas render failed");
+
+  }
+
+  status = backend.present();
+
+  if (!status) {
+
+    std::cerr << status.message() << '\n';
+
+    backend.shutdown();
+
+    DestroyWindow(window_handle);
+
+    UnregisterClassW(class_name, instance);
+
+    return fail("DX12 backend steady-state atlas present failed");
+
+  }
+
+  const auto steady_state_telemetry = backend.telemetry();
+
+  if (!steady_state_telemetry.resources.text_atlas_active || steady_state_telemetry.resources.cpu_text_bitmap_bytes != 0) {
+
+    backend.shutdown();
+
+    DestroyWindow(window_handle);
+
+    UnregisterClassW(class_name, instance);
+
+    return fail("DX12 backend did not release atlas staging memory after a stable frame");
+
+  }
+
 
 
   status = backend.resize({480, 320});
@@ -773,6 +822,9 @@ int main() {
   backend.shutdown();
 
   igr::backends::Dx12Backend interop_backend({
+      .diagnostics = {
+          .enabled = true,
+      },
       .window_handle = window_handle,
       .initial_viewport = {320, 240},
       .enable_debug_layer = true,

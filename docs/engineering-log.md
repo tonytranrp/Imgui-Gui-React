@@ -78,9 +78,30 @@
   - added D3D12 info-queue detail to DX12 command-list reset and close failures so invalid recording state is diagnosable from test output
   - aligned the DX12 sample, docs, and backend tests around the real mode contract: interop remains the backend default and atlas is an explicit low-memory mode
   - extended the DX12 backend regression binary to cover both explicit atlas mode and explicit interop mode
+- Memory audit and benchmark pass:
+  - lowered the default retained-capacity budgets for wide-string caches, scene quads, text labels, vertices, batches, shader constants, and the DX12 text atlas budget
+  - changed DX11 and DX12 scratch trimming so small scenes no longer keep the full configured budget alive after a transient spike
+  - taught DX12 to release software text-atlas staging memory after stable frames while keeping the GPU atlas alive
+  - added a repeatable `scripts/benchmark-memory.ps1` harness that samples private bytes, working set, and per-process GPU memory for the DX11 sample, DX12 sample, and React menu harness
+  - corrected DX12 texture telemetry so resource bytes are estimated from texture dimensions instead of just `ID3D12Resource::GetDesc().Width`
+  - hardened the Hermes runtime config so callers can forbid source-bundle fallback when bytecode is requested
+  - switched the live React menu harness to bytecode-only Hermes runtime loading, which cut the representative menu harness from roughly `131 MB` private / `122 MB` working set to roughly `58 MB` private / `49.5 MB` working set
+- Release memory follow-up:
+  - changed diagnostics defaults to opt-in so production callers do not pay telemetry retention unless they explicitly enable it
+  - tightened the default retained-capacity budgets again for wide-string caches, scene quads, text labels, vertices, batches, and shader constants
+  - moved the release test script onto shorter build directories after confirming `b-test-release` was tripping NMake path handling on this machine
+  - updated the benchmark harness to measure the main debug/release binaries by default and to fail early when the requested build directory does not contain the expected executables
+  - flipped the shared React-native fixture loader back toward Hermes bytecode first now that the bytecode runtime path is stable again
+  - added an opt-in Hermes working-set trim hook that runs only after explicit GC so low-memory hosts can trade some paging cost for lower steady-state working set
+  - increased the menu harness GC cadence to reduce steady-state Hermes residency in the live bytecode-backed harness
+  - captured new steady-state release baselines showing DX11 at roughly `61.6 MB` private / `53.5 MB` working set, DX12 at roughly `89.9 MB` private / `86.1 MB` working set, and the React menu harness at roughly `76.7 MB` private / `50.4 MB` working set after a 30-second warmup
+
+- React/Hermes stability follow-up:
+  - stopped deleting Hermes prepared bytecode state immediately after initialization because release-mode menu harnesses were still faulting in `hermes.dll`
+  - added repeated-render live bytecode validation to `igr_react_runtime_bridge_tests`
+  - added a `--source-runtime` switch to the menu harness so source-mode and bytecode-mode memory can be compared directly from the benchmark harness
 
 ## Current milestone
-
 DX11 and DX12 now expose the same document-level widget and custom-draw surface, the same overlay-input evaluation model, shared resource registration, host detach/rebind hooks, backend frame stats, a cross-backend shader ABI, and a transport-backed JS/native document envelope. Owned-window DX12 renders real DirectWrite text, and the Hermes bridge is now a real in-process runtime host instead of a stub.
 
 ## Next milestone

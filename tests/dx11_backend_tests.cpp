@@ -245,6 +245,7 @@ int main() {
 
   igr::backends::Dx11Backend backend({
       .diagnostics = {
+          .enabled = true,
           .memory_sample_interval = 8,
       },
       .resource_budgets = {

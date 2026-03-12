@@ -11,6 +11,11 @@
 
 namespace igr::react {
 
+enum class TransportResourceMode {
+  replace,
+  retain,
+};
+
 struct TransportFontResource {
   std::string key;
   FontResourceDesc descriptor;
@@ -35,6 +40,7 @@ struct TransportSession {
 struct TransportEnvelope {
   std::string kind{"igr.document.v1"};
   std::uint64_t sequence{};
+  TransportResourceMode resource_mode{TransportResourceMode::replace};
   TransportSession session{};
   std::vector<TransportFontResource> fonts;
   std::vector<TransportImageResource> images;

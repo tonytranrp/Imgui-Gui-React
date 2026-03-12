@@ -23,6 +23,7 @@ igr::FrameDocument build_document() {
   builder.begin_stack("layout", igr::Axis::vertical);
   builder.text("headline", "Overlay host capture");
   builder.button("cta", "Commit");
+  builder.button("disabled", "Disabled", false);
   builder.begin_clip_rect("clip", {200.0f, 96.0f});
   builder.checkbox("enabled", "Enabled", true);
   builder.image("preview", "demo-texture", {96.0f, 48.0f}, "Preview");
@@ -66,6 +67,46 @@ int main() {
       });
   if (!window_capture.within_window || window_capture.within_interactive_region || !window_capture.wants_mouse) {
     return fail("window-region capture was not detected correctly");
+  }
+
+  igr::CaptureDecision disabled_button_capture = igr::evaluate_capture(
+      document,
+      {.input_mode = igr::InputMode::external_forwarded},
+      {
+          .position = {64.0f, 154.0f},
+          .primary_down = true,
+          .keyboard_requested = true,
+      });
+  if (!disabled_button_capture.within_window || disabled_button_capture.within_interactive_region ||
+      disabled_button_capture.active_widget_id != 0) {
+    return fail("disabled buttons should not be treated as interactive capture regions");
+  }
+
+  igr::InteractionState interaction_state;
+  igr::InteractionUpdate press_update = igr::update_interaction(
+      document,
+      {.input_mode = igr::InputMode::external_forwarded},
+      {
+          .position = {64.0f, 120.0f},
+          .primary_down = true,
+          .keyboard_requested = true,
+      },
+      &interaction_state);
+  if (press_update.pressed_widget_id == 0 || press_update.clicked_widget_id != 0) {
+    return fail("interaction press tracking did not capture the pressed button");
+  }
+
+  igr::InteractionUpdate release_update = igr::update_interaction(
+      document,
+      {.input_mode = igr::InputMode::external_forwarded},
+      {
+          .position = {64.0f, 120.0f},
+          .primary_down = false,
+          .keyboard_requested = true,
+      },
+      &interaction_state);
+  if (release_update.clicked_widget_id == 0 || release_update.released_widget_id == 0 || interaction_state.pressed_widget_id != 0) {
+    return fail("interaction release tracking did not produce a click on the button");
   }
 
   igr::CaptureDecision disabled_capture = igr::evaluate_capture(

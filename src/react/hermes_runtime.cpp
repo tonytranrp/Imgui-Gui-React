@@ -1,7 +1,10 @@
 #include "igr/react/hermes_runtime.hpp"
 
+#include <Windows.h>
+
 #include <filesystem>
 #include <fstream>
+#include <psapi.h>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -203,6 +206,49 @@ Status set_named_uint32(napi_env env, napi_value object, const char* name, std::
                           std::string("Failed to set the Hermes request property '") + name + "'");
 }
 
+Status attach_request_state(napi_env env, napi_value request_object, std::string_view state_json) {
+  if (state_json.empty()) {
+    return Status::success();
+  }
+
+  napi_value global{};
+  Status status = status_from_napi(env, napi_get_global(env, &global), "Failed to access Hermes globalThis while attaching request state");
+  if (!status) {
+    return status;
+  }
+
+  napi_value json_object{};
+  status = status_from_napi(env, napi_get_named_property(env, global, "JSON", &json_object),
+                            "Failed to access globalThis.JSON while attaching request state");
+  if (!status) {
+    return status;
+  }
+
+  napi_value parse_function{};
+  status = status_from_napi(env, napi_get_named_property(env, json_object, "parse", &parse_function),
+                            "Failed to access JSON.parse while attaching request state");
+  if (!status) {
+    return status;
+  }
+
+  napi_value json_text{};
+  status = status_from_napi(env, napi_create_string_utf8(env, state_json.data(), state_json.size(), &json_text),
+                            "Failed to create the Hermes request state string");
+  if (!status) {
+    return status;
+  }
+
+  napi_value parsed_state{};
+  status = status_from_napi(env, napi_call_function(env, json_object, parse_function, 1, &json_text, &parsed_state),
+                            "Failed to parse the Hermes request state payload with JSON.parse");
+  if (!status) {
+    return status;
+  }
+
+  return status_from_napi(env, napi_set_named_property(env, request_object, "state", parsed_state),
+                          "Failed to attach the parsed request state to the Hermes request");
+}
+
 Status create_runtime_request(napi_env env, const RuntimeFrameRequest& request, napi_value* result) {
   if (result == nullptr) {
     return Status::invalid_argument("Hermes runtime request creation requires a valid output value.");
@@ -223,6 +269,10 @@ Status create_runtime_request(napi_env env, const RuntimeFrameRequest& request, 
     return status;
   }
   status = set_named_number(env, request_object, "deltaSeconds", request.frame.delta_seconds);
+  if (!status) {
+    return status;
+  }
+  status = set_named_number(env, request_object, "timeSeconds", request.frame.time_seconds);
   if (!status) {
     return status;
   }
@@ -259,6 +309,10 @@ Status create_runtime_request(napi_env env, const RuntimeFrameRequest& request, 
   if (!status) {
     return status;
   }
+  status = set_named_number(env, frame_object, "timeSeconds", request.frame.time_seconds);
+  if (!status) {
+    return status;
+  }
   status = status_from_napi(env, napi_set_named_property(env, frame_object, "viewport", viewport),
                             "Failed to attach the viewport object to the nested Hermes frame");
   if (!status) {
@@ -270,6 +324,11 @@ Status create_runtime_request(napi_env env, const RuntimeFrameRequest& request, 
     return status;
   }
 
+  status = attach_request_state(env, request_object, request.state_json);
+  if (!status) {
+    return status;
+  }
+
   *result = request_object;
   return Status::success();
 }
@@ -277,6 +336,14 @@ Status create_runtime_request(napi_env env, const RuntimeFrameRequest& request, 
 Status drain_microtasks(napi_env env) {
   bool did_run = false;
   return status_from_napi(env, jsr_drain_microtasks(env, 256, &did_run), "Failed to drain Hermes microtasks");
+}
+
+Status collect_garbage(napi_env env) {
+  return status_from_napi(env, jsr_collect_garbage(env), "Failed to trigger Hermes garbage collection");
+}
+
+void trim_process_working_set() noexcept {
+  EmptyWorkingSet(GetCurrentProcess());
 }
 
 Status stringify_js_value(napi_env env, napi_value value, std::string* output) {
@@ -448,9 +515,12 @@ struct HermesTransportRuntime::Impl {
   jsr_config config{};
   jsr_runtime runtime{};
   napi_env env{};
+  jsr_prepared_script prepared_script{};
   napi_ref entrypoint_ref{};
+  std::vector<std::uint8_t> bytecode_storage;
   bool loaded_from_bytecode{false};
   std::string loaded_bundle_path;
+  std::uint64_t render_count{};
 #endif
 };
 
@@ -482,6 +552,7 @@ Status HermesTransportRuntime::initialize() {
   const std::filesystem::path bytecode_path(config_.bundle.bytecode_path);
   const std::filesystem::path source_path(config_.bundle.bundle_path);
   const bool source_bundle_available = !config_.bundle.bundle_path.empty() && std::filesystem::exists(source_path);
+  const bool allow_source_fallback = config_.bundle.allow_source_fallback && source_bundle_available;
   const bool use_bytecode = config_.bundle.prefer_bytecode && !config_.bundle.bytecode_path.empty() && std::filesystem::exists(bytecode_path);
   if (!use_bytecode && !source_bundle_available) {
     return Status::invalid_argument(
@@ -500,6 +571,14 @@ Status HermesTransportRuntime::initialize() {
   if (!status) {
     shutdown();
     return status;
+  }
+
+  if (config_.enable_gc_api) {
+    status = status_from_napi(nullptr, jsr_config_enable_gc_api(impl_->config, true), "Failed to enable the Hermes GC API");
+    if (!status) {
+      shutdown();
+      return status;
+    }
   }
 
   if (config_.enable_inspector) {
@@ -541,18 +620,22 @@ Status HermesTransportRuntime::initialize() {
   }
 
   if (use_bytecode) {
-    std::vector<std::uint8_t> bytecode;
-    status = read_binary_file(bytecode_path, &bytecode);
+    impl_->bytecode_storage.clear();
+    status = read_binary_file(bytecode_path, &impl_->bytecode_storage);
     if (!status) {
       shutdown();
       return status;
     }
 
-    jsr_prepared_script prepared_script{};
     const std::string source_url = bytecode_path.string();
     status = status_from_napi(impl_->env,
-                              jsr_create_prepared_script(impl_->env, bytecode.data(), bytecode.size(), noop_script_delete, nullptr,
-                                                         source_url.c_str(), &prepared_script),
+                              jsr_create_prepared_script(impl_->env,
+                                                         impl_->bytecode_storage.data(),
+                                                         impl_->bytecode_storage.size(),
+                                                         noop_script_delete,
+                                                         nullptr,
+                                                         source_url.c_str(),
+                                                         &impl_->prepared_script),
                               "Failed to create the prepared Hermes bytecode script");
     if (!status) {
       shutdown();
@@ -560,9 +643,8 @@ Status HermesTransportRuntime::initialize() {
     }
 
     napi_value ignored_result{};
-    status = status_from_napi(impl_->env, jsr_prepared_script_run(impl_->env, prepared_script, &ignored_result),
+    status = status_from_napi(impl_->env, jsr_prepared_script_run(impl_->env, impl_->prepared_script, &ignored_result),
                               "Failed to execute the prepared Hermes bytecode bundle");
-    jsr_delete_prepared_script(impl_->env, prepared_script);
     if (!status) {
       shutdown();
       return status;
@@ -582,7 +664,7 @@ Status HermesTransportRuntime::initialize() {
   }
 
   status = resolve_entrypoint_reference(impl_->env, config_.bundle.entrypoint, &impl_->entrypoint_ref);
-  if (!status && impl_->loaded_from_bytecode && source_bundle_available) {
+  if (!status && impl_->loaded_from_bytecode && allow_source_fallback) {
     status = run_source_bundle(impl_->env, source_path);
     if (!status) {
       shutdown();
@@ -598,6 +680,17 @@ Status HermesTransportRuntime::initialize() {
   if (!status) {
     shutdown();
     return status;
+  }
+
+  if (config_.enable_gc_api && config_.collect_garbage_after_initialize) {
+    status = collect_garbage(impl_->env);
+    if (!status) {
+      shutdown();
+      return status;
+    }
+    if (config_.trim_working_set_after_gc) {
+      trim_process_working_set();
+    }
   }
 
   initialized_ = true;
@@ -661,7 +754,24 @@ Status HermesTransportRuntime::render_transport(const RuntimeFrameRequest& reque
   }
 
   response->sequence = request.frame.frame_index;
-  return stringify_js_value(impl_->env, call_result, &response->payload);
+  status = stringify_js_value(impl_->env, call_result, &response->payload);
+  if (!status) {
+    return status;
+  }
+
+  impl_->render_count += 1;
+  if (config_.enable_gc_api && config_.collect_garbage_every_n_renders > 0 &&
+      (impl_->render_count % config_.collect_garbage_every_n_renders) == 0) {
+    status = collect_garbage(impl_->env);
+    if (!status) {
+      return status;
+    }
+    if (config_.trim_working_set_after_gc) {
+      trim_process_working_set();
+    }
+  }
+
+  return Status::success();
 #endif
 }
 
@@ -674,6 +784,14 @@ void HermesTransportRuntime::shutdown() noexcept {
         napi_delete_reference(impl_->env, impl_->entrypoint_ref);
       }
       impl_->entrypoint_ref = nullptr;
+    }
+
+    if (impl_->env != nullptr && impl_->prepared_script != nullptr) {
+      ScopedEnvScope env_scope(impl_->env);
+      if (env_scope.status()) {
+        jsr_delete_prepared_script(impl_->env, impl_->prepared_script);
+      }
+      impl_->prepared_script = nullptr;
     }
 
     if (impl_->runtime != nullptr) {
@@ -689,6 +807,9 @@ void HermesTransportRuntime::shutdown() noexcept {
 
     impl_->loaded_from_bytecode = false;
     impl_->loaded_bundle_path.clear();
+    impl_->bytecode_storage.clear();
+    impl_->bytecode_storage.shrink_to_fit();
+    impl_->render_count = 0;
   }
 #endif
 

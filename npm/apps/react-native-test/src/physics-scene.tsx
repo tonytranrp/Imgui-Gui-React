@@ -281,16 +281,27 @@ export function PhysicsOverlayScene(request: number | PhysicsFrameRequest = 1): 
   );
 }
 
-export function createPhysicsTransportEnvelope(request: number | PhysicsFrameRequest = 1): TransportEnvelope {
+export interface PhysicsTransportOptions {
+  includeResources?: boolean;
+  resourceMode?: "replace" | "retain";
+}
+
+export function createPhysicsTransportEnvelope(
+  request: number | PhysicsFrameRequest = 1,
+  options: PhysicsTransportOptions = {}
+): TransportEnvelope {
   const frame = resolveFrameState(request);
+  const includeResources = options.includeResources ?? true;
   return createTransportEnvelope(PhysicsOverlayScene(request), frame.frameIndex, {
     session,
-    fonts: [...fonts],
-    images: [...images],
-    shaders: [...shaders]
+    ...(options.resourceMode !== undefined ? { resourceMode: options.resourceMode } : {}),
+    ...(includeResources ? { fonts: [...fonts], images: [...images], shaders: [...shaders] } : {})
   });
 }
 
-export function createPhysicsTransportPayload(request: number | PhysicsFrameRequest = 1): string {
-  return serializeTransportEnvelope(createPhysicsTransportEnvelope(request));
+export function createPhysicsTransportPayload(
+  request: number | PhysicsFrameRequest = 1,
+  options: PhysicsTransportOptions = {}
+): string {
+  return serializeTransportEnvelope(createPhysicsTransportEnvelope(request, options));
 }

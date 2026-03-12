@@ -1,0 +1,21 @@
+{
+  "extends": "../../typescript/tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@igr/react",
+    "types": ["node"],
+    "typeRoots": ["../../npm/node_modules/@types"],
+    "baseUrl": "../..",
+    "paths": {
+      "@igr/core": ["npm/packages/core/src/index.ts"],
+      "@igr/react": ["npm/packages/react/src/index.ts"],
+      "@igr/react/jsx-runtime": ["npm/packages/react/src/jsx-runtime.ts"]
+    }
+  },
+  "include": [
+    "generated/**/*.ts",
+    "*.ts",
+    "*.tsx"
+  ]
+}

@@ -37,7 +37,26 @@ struct CaptureDecision {
   bool wants_keyboard{};
 };
 
+struct InteractionState {
+  WidgetId hovered_widget_id{};
+  WidgetId pressed_widget_id{};
+  bool primary_down{};
+};
+
+struct InteractionUpdate {
+  CaptureDecision capture{};
+  WidgetId pressed_widget_id{};
+  WidgetId released_widget_id{};
+  WidgetId clicked_widget_id{};
+};
+
 [[nodiscard]] InteractionMap build_interaction_map(const FrameDocument& document);
 [[nodiscard]] CaptureDecision evaluate_capture(const FrameDocument& document, const BackendHostOptions& host, const PointerInputState& state);
+[[nodiscard]] InteractionUpdate update_interaction(const FrameDocument& document,
+                                                   const BackendHostOptions& host,
+                                                   const PointerInputState& state,
+                                                   InteractionState* interaction_state);
+[[nodiscard]] const WidgetNode* find_widget_by_id(const FrameDocument& document, WidgetId id) noexcept;
+[[nodiscard]] std::string_view find_widget_key(const FrameDocument& document, WidgetId id) noexcept;
 
 }  // namespace igr

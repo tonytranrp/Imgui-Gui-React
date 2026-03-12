@@ -8,7 +8,9 @@
     "apps/react-native-test"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build:workspaces": "npm run build --workspaces --if-present",
+    "build:menu": "node ../tests/menu/build-menu-assets.mjs",
+    "build": "npm run build:workspaces && npm run build:menu",
     "export:fixtures": "node ./tools/export-fixtures.mjs",
     "hermes:bundle": "node ./tools/build-hermes-bundle.mjs",
     "test": "npm run build && npm run export:fixtures && node ./tools/run-tests.mjs"

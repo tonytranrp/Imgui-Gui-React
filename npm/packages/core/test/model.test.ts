@@ -56,6 +56,7 @@ test("transport envelope round-trips a declarative tree", () => {
         clearTarget: false
       }
     },
+    resourceMode: "retain",
     fonts: [{ key: "body-md", family: "Segoe UI", size: 15 }],
     images: [{ key: "preview-card", texture: "preview-texture", width: 96, height: 48 }]
   });
@@ -63,6 +64,7 @@ test("transport envelope round-trips a declarative tree", () => {
   assert.equal(parsed.kind, "igr.document.v1");
   assert.equal(parsed.sequence, 7);
   assert.equal(parsed.session?.name, "transport-model-test");
+  assert.equal(parsed.resourceMode, "retain");
   assert.equal(parsed.images?.[0]?.texture, "preview-texture");
   assert.equal(parsed.root.children[0]?.props.font, "body-md");
 });

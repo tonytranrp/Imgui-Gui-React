@@ -100,15 +100,20 @@ inline Status load_react_native_fixture(FrameInfo info, react::TransportEnvelope
 inline Status load_react_native_scene(FrameInfo info, react::TransportEnvelope* envelope, FrameDocument* document, std::string* payload = nullptr) {
 #if IGR_ENABLE_HERMES
   if (std::filesystem::exists(react_native_bundle_path())) {
-    react::RuntimeDocumentBridge bridge(std::make_unique<react::HermesTransportRuntime>(react::HermesRuntimeConfig{
-        .bundle = {
-            .bundle_path = react_native_bundle_path().string(),
-            .bytecode_path = react_native_bytecode_path().string(),
-            .entrypoint = "__igrRenderTransport",
-            .prefer_bytecode = false,
-        },
-        .enable_inspector = false,
-    }));
+    react::RuntimeDocumentBridge bridge(
+        std::make_unique<react::HermesTransportRuntime>(react::HermesRuntimeConfig{
+            .bundle = {
+                .bundle_path = react_native_bundle_path().string(),
+                .bytecode_path = react_native_bytecode_path().string(),
+                .entrypoint = "__igrRenderTransport",
+                .prefer_bytecode = true,
+            },
+            .enable_inspector = false,
+        }),
+        {
+            .retain_last_envelope = envelope != nullptr,
+            .retain_last_payload = payload != nullptr,
+        });
 
     Status status = bridge.initialize();
     if (!status) {

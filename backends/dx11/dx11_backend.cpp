@@ -348,18 +348,28 @@ void trim_wide_text_cache(StringMap<std::wstring>& cache, const ResourceBudgetCo
   detail::release_storage(cache);
 }
 
+std::size_t retained_capacity_target(std::size_t active_count, std::size_t max_retained, std::size_t minimum_capacity) {
+  if (max_retained == 0) {
+    return 0;
+  }
+  const std::size_t slack_target = active_count + active_count / 2;
+  const std::size_t bounded_target = (std::min)(max_retained, (std::max)(slack_target, minimum_capacity));
+  return (std::max)(active_count, bounded_target);
+}
+
 template <typename T>
-void trim_vector_capacity(std::vector<T>& storage, std::size_t max_retained) {
+void trim_vector_capacity(std::vector<T>& storage, std::size_t max_retained, std::size_t minimum_capacity = 64) {
   if (max_retained == 0) {
     storage.clear();
     detail::release_storage(storage);
     return;
   }
-  if (storage.capacity() <= max_retained * 2) {
+  const std::size_t target_capacity = retained_capacity_target(storage.size(), max_retained, minimum_capacity);
+  if (storage.capacity() <= target_capacity * 2) {
     return;
   }
   std::vector<T> trimmed;
-  trimmed.reserve((std::max)(storage.size(), max_retained));
+  trimmed.reserve(target_capacity);
   for (auto& item : storage) {
     trimmed.push_back(std::move(item));
   }
@@ -370,10 +380,10 @@ void trim_scratch_storage(Scene& scene,
                           std::vector<QuadVertex>& vertices,
                           std::vector<DrawBatch>& batches,
                           const ResourceBudgetConfig& budgets) {
-  trim_vector_capacity(scene.quads, budgets.max_retained_scene_quads);
-  trim_vector_capacity(scene.labels, budgets.max_retained_text_labels);
-  trim_vector_capacity(vertices, budgets.max_retained_vertices);
-  trim_vector_capacity(batches, budgets.max_retained_batches);
+  trim_vector_capacity(scene.quads, budgets.max_retained_scene_quads, 128);
+  trim_vector_capacity(scene.labels, budgets.max_retained_text_labels, 64);
+  trim_vector_capacity(vertices, budgets.max_retained_vertices, 256);
+  trim_vector_capacity(batches, budgets.max_retained_batches, 64);
 }
 
 void trim_vertex_buffer(ID3D11DeviceContext* context,
@@ -385,11 +395,19 @@ void trim_vertex_buffer(ID3D11DeviceContext* context,
     return;
   }
   const std::size_t retained_limit = budgets.max_retained_vertices;
-  if (retained_limit != 0 && active_vertex_count > retained_limit) {
+  if (retained_limit == 0) {
+    if (context != nullptr) {
+      ID3D11Buffer* null_buffer = nullptr;
+      const UINT stride = 0;
+      const UINT offset = 0;
+      context->IASetVertexBuffers(0, 1, &null_buffer, &stride, &offset);
+    }
+    vertex_buffer.Reset();
+    vertex_capacity = 0;
     return;
   }
-  const std::size_t oversized_threshold = retained_limit == 0 ? 0 : retained_limit * 2;
-  if (retained_limit != 0 && vertex_capacity <= oversized_threshold) {
+  const std::size_t target_capacity = retained_capacity_target(active_vertex_count, retained_limit, 256);
+  if (vertex_capacity <= target_capacity * 2) {
     return;
   }
 
@@ -1684,7 +1702,7 @@ Status Dx11Backend::initialize() {
       viewport_.height = std::max(static_cast<std::uint32_t>(r.bottom - r.top), 1u);
     }
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
-    DXGI_SWAP_CHAIN_DESC sc{}; sc.BufferCount = 2; sc.BufferDesc.Width = viewport_.width; sc.BufferDesc.Height = viewport_.height;
+    DXGI_SWAP_CHAIN_DESC sc{}; sc.BufferCount = 1; sc.BufferDesc.Width = viewport_.width; sc.BufferDesc.Height = viewport_.height;
     sc.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; sc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sc.OutputWindow = config_.window_handle;
     sc.SampleDesc.Count = 1; sc.Windowed = TRUE; sc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     const auto create_device = [&](D3D_DRIVER_TYPE driver, UINT local_flags) {

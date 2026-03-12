@@ -49,8 +49,9 @@ enum class Dx12TextRendererMode {
 };
 
 struct Dx12TextAtlasConfig {
-  std::uint32_t max_dimension{2048};
+  std::uint32_t max_dimension{1024};
   std::uint32_t padding{1};
+  std::uint32_t staging_release_frame_threshold{1};
 };
 
 struct Dx12HostBinding {
@@ -89,9 +90,9 @@ struct Dx12BackendConfig {
   IDXGISwapChain3* swap_chain{};
   bool enable_debug_layer{false};
   bool enable_vsync{true};
-  Dx12TextRendererMode text_renderer{Dx12TextRendererMode::interop};
+  Dx12TextRendererMode text_renderer{Dx12TextRendererMode::atlas};
   Dx12TextAtlasConfig text_atlas{};
-  std::uint32_t text_interop_idle_frame_threshold{120};
+  std::uint32_t text_interop_idle_frame_threshold{8};
   std::array<float, 4> clear_color{0.05f, 0.06f, 0.08f, 1.0f};
   Dx12Theme theme{};
 };

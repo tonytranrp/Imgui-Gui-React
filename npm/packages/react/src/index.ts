@@ -31,6 +31,7 @@ export {
   type TransportFontResource,
   type TransportHostOptions,
   type TransportImageResource,
+  type TransportResourceMode,
   type TransportSession,
   type TransportShaderResource,
   type TransportShaderStage,

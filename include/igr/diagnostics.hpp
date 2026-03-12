@@ -10,7 +10,7 @@ struct IDXGIAdapter;
 namespace igr {
 
 struct DiagnosticsConfig {
-  bool enabled{true};
+  bool enabled{false};
   bool collect_process_memory{true};
   bool collect_gpu_memory{true};
   bool collect_scope_timings{true};
@@ -20,13 +20,13 @@ struct DiagnosticsConfig {
 };
 
 struct ResourceBudgetConfig {
-  std::size_t max_cached_wide_strings{2048};
-  std::size_t max_retained_scene_quads{8192};
-  std::size_t max_retained_text_labels{4096};
-  std::size_t max_retained_vertices{49152};
-  std::size_t max_retained_batches{8192};
-  std::size_t max_retained_shader_constants{1024};
-  std::size_t max_text_atlas_dimension{2048};
+  std::size_t max_cached_wide_strings{128};
+  std::size_t max_retained_scene_quads{1024};
+  std::size_t max_retained_text_labels{512};
+  std::size_t max_retained_vertices{6144};
+  std::size_t max_retained_batches{512};
+  std::size_t max_retained_shader_constants{64};
+  std::size_t max_text_atlas_dimension{1024};
   std::size_t text_atlas_padding{1};
 };
 

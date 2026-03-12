@@ -14,7 +14,7 @@ class FrameBuilder {
  public:
   Status begin_window(std::string_view key, std::string_view title, Rect bounds);
   Status begin_stack(std::string_view key, Axis axis);
-  Status begin_clip_rect(std::string_view key, ExtentF extent = {});
+  Status begin_clip_rect(std::string_view key, ExtentF extent = {-1.0f, -1.0f});
   Status text(std::string_view key, std::string_view value, std::string_view font = {});
   Status button(std::string_view key, std::string_view label, bool enabled = true);
   Status checkbox(std::string_view key, std::string_view label, bool checked);
@@ -53,6 +53,7 @@ class FrameBuilder {
   FrameDocument* document_{};
   std::vector<WidgetNode*> stack_;
   std::vector<WidgetId> scope_ids_;
+  std::vector<std::size_t> child_ordinals_;
 };
 
 class UiContext {

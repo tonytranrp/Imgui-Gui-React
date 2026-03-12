@@ -159,7 +159,7 @@ igr::FrameDocument build_demo_document(std::uint64_t frame_index,
                                        igr::ExtentU viewport,
                                        std::string_view preview_texture,
                                        std::string_view preview_resource,
-                                       const igr::BackendTelemetrySnapshot& telemetry) {
+                                       const igr::BackendTelemetrySnapshot* telemetry) {
   const float native_progress = static_cast<float>(std::fmod(elapsed_seconds * 0.25, 1.0));
   const float bridge_progress = static_cast<float>(std::fmod(elapsed_seconds * 0.18 + 0.33, 1.0));
   const bool validation_enabled = (frame_index / 90) % 2 == 0;
@@ -255,27 +255,29 @@ igr::FrameDocument build_demo_document(std::uint64_t frame_index,
 
   igr::react::materialize(bridge_window, builder);
 
-  builder.begin_window("runtime-diagnostics", "Runtime Telemetry", {{952.0f, 32.0f}, {292.0f, 242.0f}});
-  builder.begin_stack("runtime-diagnostics-layout", igr::Axis::vertical);
-  builder.text("diag-working-set", "Working set: " + format_mebibytes(telemetry.process_memory.working_set_bytes), "body-md");
-  builder.text("diag-private", "Private bytes: " + format_mebibytes(telemetry.process_memory.private_bytes), "body-md");
-  builder.text("diag-scene", "Scene scratch: " + format_mebibytes(telemetry.resources.scene_bytes + telemetry.resources.scratch_vertex_bytes +
-                                                                   telemetry.resources.scratch_batch_bytes),
-               "body-md");
-  builder.text("diag-cache", "Text cache: " + format_mebibytes(telemetry.resources.wide_text_cache_bytes), "body-md");
-  if (telemetry.gpu_memory.available) {
-    builder.text("diag-gpu", "GPU local: " + format_mebibytes(telemetry.gpu_memory.local_usage_bytes) + " / " +
-                                  format_mebibytes(telemetry.gpu_memory.local_budget_bytes),
+  if (telemetry != nullptr) {
+    builder.begin_window("runtime-diagnostics", "Runtime Telemetry", {{952.0f, 32.0f}, {292.0f, 242.0f}});
+    builder.begin_stack("runtime-diagnostics-layout", igr::Axis::vertical);
+    builder.text("diag-working-set", "Working set: " + format_mebibytes(telemetry->process_memory.working_set_bytes), "body-md");
+    builder.text("diag-private", "Private bytes: " + format_mebibytes(telemetry->process_memory.private_bytes), "body-md");
+    builder.text("diag-scene", "Scene scratch: " + format_mebibytes(telemetry->resources.scene_bytes + telemetry->resources.scratch_vertex_bytes +
+                                                                     telemetry->resources.scratch_batch_bytes),
                  "body-md");
+    builder.text("diag-cache", "Text cache: " + format_mebibytes(telemetry->resources.wide_text_cache_bytes), "body-md");
+    if (telemetry->gpu_memory.available) {
+      builder.text("diag-gpu", "GPU local: " + format_mebibytes(telemetry->gpu_memory.local_usage_bytes) + " / " +
+                                    format_mebibytes(telemetry->gpu_memory.local_budget_bytes),
+                   "body-md");
+    }
+    builder.separator("diag-separator");
+    if (!telemetry->scopes.empty()) {
+      const auto& scope = telemetry->scopes.front();
+      builder.text("diag-top-scope", "Top scope: " + scope.name + " (" + std::to_string(scope.total_microseconds) + " us)", "body-md");
+    }
+    builder.text("diag-batches", "Batches: " + std::to_string(telemetry->frame.draw_batch_count), "body-md");
+    builder.end_container();
+    builder.end_container();
   }
-  builder.separator("diag-separator");
-  if (!telemetry.scopes.empty()) {
-    const auto& scope = telemetry.scopes.front();
-    builder.text("diag-top-scope", "Top scope: " + scope.name + " (" + std::to_string(scope.total_microseconds) + " us)", "body-md");
-  }
-  builder.text("diag-batches", "Batches: " + std::to_string(telemetry.frame.draw_batch_count), "body-md");
-  builder.end_container();
-  builder.end_container();
   return context.end_frame();
 }
 
@@ -311,6 +313,7 @@ int run_application(int argc, char** argv) {
   const bool enable_debug_layer = has_flag(argc, argv, "--debug-layer");
   const bool disable_vsync = has_flag(argc, argv, "--no-vsync");
   const bool force_vsync = has_flag(argc, argv, "--vsync");
+  const bool enable_diagnostics = has_flag(argc, argv, "--diagnostics");
   const bool enable_vsync = force_vsync ? true : (disable_vsync ? false : !frame_limit.has_value());
 
   const HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -362,6 +365,7 @@ int run_application(int argc, char** argv) {
   theme.title_text_size = 16.0f;
 
   igr::backends::Dx11Backend backend({
+      .diagnostics = {.enabled = enable_diagnostics},
       .window_handle = window_handle,
       .initial_viewport = {1280, 720},
       .enable_debug_layer = enable_debug_layer,
@@ -498,8 +502,12 @@ int run_application(int argc, char** argv) {
     const double delta_seconds = std::chrono::duration<double>(now - previous_frame_time).count();
     previous_frame_time = now;
 
-    const igr::FrameDocument document =
-        build_demo_document(++frame_index, elapsed_seconds, delta_seconds, app_state.viewport, "demo-texture", "demo-card", backend.telemetry());
+    std::optional<igr::BackendTelemetrySnapshot> telemetry;
+    if (enable_diagnostics) {
+      telemetry = backend.telemetry();
+    }
+    const igr::FrameDocument document = build_demo_document(++frame_index, elapsed_seconds, delta_seconds, app_state.viewport, "demo-texture",
+                                                            "demo-card", telemetry ? &*telemetry : nullptr);
     igr::Status status = backend.render(document);
     if (!status) {
       show_error_box(window_handle, "IGR DX11 Sample", "Dx11Backend render failed: " + status.message());

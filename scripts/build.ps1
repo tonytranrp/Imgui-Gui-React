@@ -2,7 +2,7 @@ param(
   [ValidateSet("Debug", "Release")]
   [string]$Configuration = "Debug",
   [string]$BuildDirName,
-  [switch]$EnableGlslShaders
+  [bool]$EnableGlslShaders = $true
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,7 +26,7 @@ $buildDirName = if ([string]::IsNullOrWhiteSpace($BuildDirName)) {
   $BuildDirName
 }
 $buildDir = Join-Path $repoRoot $buildDirName
-$glslOption = if ($EnableGlslShaders.IsPresent) { "ON" } else { "OFF" }
+$glslOption = if ($EnableGlslShaders) { "ON" } else { "OFF" }
 
 if (Test-Path $buildDir) {
   foreach ($entry in Get-ChildItem -Path $buildDir -Force | Where-Object { $_.Name -ne "Testing" }) {

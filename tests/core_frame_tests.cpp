@@ -132,6 +132,36 @@ int main() {
     return fail("unexpected diagnostics in closed frame");
   }
 
+  status = context.begin_frame({
+      .frame_index = 9,
+      .viewport = {800, 600},
+      .delta_seconds = 1.0 / 60.0,
+  });
+  if (!status) {
+    return fail("third begin_frame failed");
+  }
+
+  auto& anonymous_builder = context.builder();
+  anonymous_builder.begin_window("anonymous-window", "Anonymous", {{0.0f, 0.0f}, {180.0f, 120.0f}});
+  anonymous_builder.begin_stack("anonymous-layout", igr::Axis::vertical);
+  anonymous_builder.button({}, "First");
+  anonymous_builder.button({}, "Second");
+  anonymous_builder.begin_clip_rect("explicit-zero-clip", {0.0f, 0.0f});
+  anonymous_builder.text({}, "Collapsed");
+  anonymous_builder.end_container();
+  anonymous_builder.end_container();
+  anonymous_builder.end_container();
+
+  const auto anonymous_document = context.end_frame();
+  const auto& anonymous_children = anonymous_document.roots.front().children.front().children;
+  if (anonymous_children[0].id == anonymous_children[1].id) {
+    return fail("anonymous sibling widgets should not collide on widget id");
+  }
+  if (anonymous_children[2].attributes.size() != 2 || anonymous_children[2].attributes[0].value != "0" ||
+      anonymous_children[2].attributes[1].value != "0") {
+    return fail("explicit zero-sized clip rects should preserve zero extents");
+  }
+
   std::cout << "igr_core_tests passed" << '\n';
   return 0;
 }

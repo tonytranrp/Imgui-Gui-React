@@ -21,10 +21,28 @@ std::optional<float> attr_float(const WidgetNode& node, std::string_view name) {
   return std::nullopt;
 }
 
+bool attr_bool(const WidgetNode& node, std::string_view name, bool fallback) {
+  for (const auto& attribute : node.attributes) {
+    if (attribute.name != name) {
+      continue;
+    }
+    if (attribute.value == "true") {
+      return true;
+    }
+    if (attribute.value == "false") {
+      return false;
+    }
+  }
+  return fallback;
+}
+
 Rect window_rect(const WidgetNode& node) {
   return {
       .origin = {attr_float(node, "x").value_or(32.0f), attr_float(node, "y").value_or(32.0f)},
-      .extent = {attr_float(node, "width").value_or(420.0f), attr_float(node, "height").value_or(260.0f)},
+      .extent = {
+          std::max(0.0f, attr_float(node, "width").value_or(420.0f)),
+          std::max(0.0f, attr_float(node, "height").value_or(260.0f)),
+      },
   };
 }
 
@@ -107,8 +125,13 @@ bool is_horizontal_stack(const WidgetNode& node) {
 }
 
 void push_region(InteractionMap& map, const WidgetNode& node, Rect bounds, const std::optional<Rect>& clip_rect) {
-  const bool interactive = node.kind == WidgetKind::button || node.kind == WidgetKind::checkbox || node.kind == WidgetKind::image;
-  const bool keyboard_focusable = node.kind == WidgetKind::button || node.kind == WidgetKind::checkbox;
+  if (bounds.extent.x <= 0.0f || bounds.extent.y <= 0.0f) {
+    return;
+  }
+
+  const bool button_enabled = node.kind != WidgetKind::button || attr_bool(node, "enabled", true);
+  const bool interactive = (node.kind == WidgetKind::button && button_enabled) || node.kind == WidgetKind::checkbox || node.kind == WidgetKind::image;
+  const bool keyboard_focusable = (node.kind == WidgetKind::button && button_enabled) || node.kind == WidgetKind::checkbox;
   if (node.kind == WidgetKind::window || interactive) {
     map.regions.push_back({
         .id = node.id,
@@ -129,7 +152,10 @@ void build_regions(const WidgetNode& node, Rect area, float padding, float title
       push_region(map, node, rect, clip_rect);
       Rect inner{
           .origin = {rect.origin.x + padding, rect.origin.y + title_height + padding},
-          .extent = {rect.extent.x - padding * 2.0f, rect.extent.y - title_height - padding * 2.0f},
+          .extent = {
+              std::max(0.0f, rect.extent.x - padding * 2.0f),
+              std::max(0.0f, rect.extent.y - title_height - padding * 2.0f),
+          },
       };
       for (const auto& child : node.children) {
         build_regions(child, inner, padding, title_height, item_spacing, map, clip_rect);
@@ -138,7 +164,9 @@ void build_regions(const WidgetNode& node, Rect area, float padding, float title
     }
     case WidgetKind::stack: {
       if (is_horizontal_stack(node) && !node.children.empty()) {
-        const float width = (area.extent.x - static_cast<float>(node.children.size() - 1) * item_spacing) / static_cast<float>(node.children.size());
+        const float width = std::max(
+            0.0f,
+            (area.extent.x - static_cast<float>(node.children.size() - 1) * item_spacing) / static_cast<float>(node.children.size()));
         float x = area.origin.x;
         for (const auto& child : node.children) {
           build_regions(child, {{x, area.origin.y}, {width, area.extent.y}}, padding, title_height, item_spacing, map, clip_rect);
@@ -158,10 +186,10 @@ void build_regions(const WidgetNode& node, Rect area, float padding, float title
     case WidgetKind::clip_rect: {
       Rect clip_area = area;
       if (const auto width = attr_float(node, "width")) {
-        clip_area.extent.x = std::min(*width, area.extent.x);
+        clip_area.extent.x = std::max(0.0f, std::min(*width, area.extent.x));
       }
       if (const auto height = attr_float(node, "height")) {
-        clip_area.extent.y = std::min(*height, area.extent.y);
+        clip_area.extent.y = std::max(0.0f, std::min(*height, area.extent.y));
       }
       const auto nested_clip = intersect_clip(clip_rect, clip_area);
       float y = clip_area.origin.y;
@@ -179,6 +207,38 @@ void build_regions(const WidgetNode& node, Rect area, float padding, float title
 }
 
 }  // namespace
+
+const WidgetNode* find_widget_by_id(const FrameDocument& document, WidgetId id) noexcept {
+  if (id == 0) {
+    return nullptr;
+  }
+
+  const auto find_in_node = [&](const WidgetNode& node, const auto& self) -> const WidgetNode* {
+    if (node.id == id) {
+      return &node;
+    }
+    for (const auto& child : node.children) {
+      if (const WidgetNode* match = self(child, self); match != nullptr) {
+        return match;
+      }
+    }
+    return nullptr;
+  };
+
+  for (const auto& root : document.roots) {
+    if (const WidgetNode* match = find_in_node(root, find_in_node); match != nullptr) {
+      return match;
+    }
+  }
+  return nullptr;
+}
+
+std::string_view find_widget_key(const FrameDocument& document, WidgetId id) noexcept {
+  if (const WidgetNode* node = find_widget_by_id(document, id); node != nullptr) {
+    return node->key;
+  }
+  return {};
+}
 
 InteractionMap build_interaction_map(const FrameDocument& document) {
   InteractionMap map;
@@ -230,6 +290,39 @@ CaptureDecision evaluate_capture(const FrameDocument& document, const BackendHos
   decision.wants_mouse = decision.within_window;
   decision.wants_keyboard = decision.within_window && state.keyboard_requested;
   return decision;
+}
+
+InteractionUpdate update_interaction(const FrameDocument& document,
+                                     const BackendHostOptions& host,
+                                     const PointerInputState& state,
+                                     InteractionState* interaction_state) {
+  InteractionUpdate update;
+  update.capture = evaluate_capture(document, host, state);
+  if (interaction_state == nullptr) {
+    return update;
+  }
+
+  const bool pressed_this_frame = state.primary_down && !interaction_state->primary_down;
+  const bool released_this_frame = !state.primary_down && interaction_state->primary_down;
+  const WidgetId previously_pressed = interaction_state->pressed_widget_id;
+
+  interaction_state->hovered_widget_id = update.capture.hovered_widget_id;
+
+  if (pressed_this_frame) {
+    interaction_state->pressed_widget_id = update.capture.active_widget_id;
+    update.pressed_widget_id = interaction_state->pressed_widget_id;
+  } else if (released_this_frame) {
+    update.released_widget_id = previously_pressed;
+    if (previously_pressed != 0 && update.capture.within_interactive_region && update.capture.hovered_widget_id == previously_pressed) {
+      update.clicked_widget_id = previously_pressed;
+    }
+    interaction_state->pressed_widget_id = 0;
+  } else {
+    update.pressed_widget_id = interaction_state->pressed_widget_id;
+  }
+
+  interaction_state->primary_down = state.primary_down;
+  return update;
 }
 
 }  // namespace igr

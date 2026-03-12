@@ -1,0 +1,12 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/Users/tonyi/OneDrive/Documents/GitHub/Imgui-Gui-React/btr/cmake_install.cmake",
+		"C:/Users/tonyi/OneDrive/Documents/GitHub/Imgui-Gui-React/.cache/fetchcontent/glslang-build/cmake_install.cmake",
+		"C:/Users/tonyi/OneDrive/Documents/GitHub/Imgui-Gui-React/.cache/fetchcontent/glslang-build/SPIRV/cmake_install.cmake",
+		"C:/Users/tonyi/OneDrive/Documents/GitHub/Imgui-Gui-React/.cache/fetchcontent/glslang-build/glslang/cmake_install.cmake",
+		"C:/Users/tonyi/OneDrive/Documents/GitHub/Imgui-Gui-React/.cache/fetchcontent/glslang-build/glslang/OSDependent/Windows/cmake_install.cmake",
+		"C:/Users/tonyi/OneDrive/Documents/GitHub/Imgui-Gui-React/.cache/fetchcontent/spirv_cross-build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

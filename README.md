@@ -11,7 +11,7 @@ The repository now contains the production foundation:
 - a buildable C++ core with deterministic frame and widget modeling
 - a live DirectX 11 backend with real device, swap chain, resize, render, present, theme, DirectWrite text, user-texture image paths, and custom draw primitives
 - manual host-binding support for DX11, including host-managed present and resize flows, clip-rect scissoring, and overlay-safe no-clear composition
-- a live DirectX 12 backend with owned-window rendering, a conservative D3D11On12 text path by default plus an opt-in lower-memory software text atlas, host-managed frame binding, descriptor-backed textures, custom draw primitives, and runtime validation for injected and external-host usage
+- a live DirectX 12 backend with owned-window rendering, the lower-memory software text atlas enabled by default, an optional D3D11On12 interop fallback, host-managed frame binding, descriptor-backed textures, custom draw primitives, and runtime validation for injected and external-host usage
 - a shared shader system for DX11 and DX12 with HLSL and GLSL support, `shader_rect` and `shader_image` widgets, runtime compilation, and React/transport authoring support
 - a shared overlay-input evaluation utility for injected/manual-host integrations
 - a declarative materializer that maps React-style element trees onto the immediate-mode core
@@ -39,6 +39,7 @@ Both native backends now share the same document-driven widget set, resource reg
 ```powershell
 ./scripts/build.ps1
 ./scripts/test.ps1
+./scripts/benchmark-memory.ps1
 ./b/igr_win32_dx11_sample.exe --frames 120
 ```
 
@@ -62,5 +63,6 @@ Both native backends now share the same document-driven widget set, resource reg
 - [Shaders](docs/shaders.md)
 - [TypeScript Bridge](docs/typescript-bridge.md)
 - [Hermes Bridge](docs/hermes.md)
+- [Memory and Diagnostics](docs/memory.md)
 - [Engineering Log](docs/engineering-log.md)
 - [Contributing](CONTRIBUTING.md)

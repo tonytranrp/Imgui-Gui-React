@@ -178,7 +178,7 @@ add_library(igr_backend_dx12 STATIC
 add_library(igr::backend_dx12 ALIAS igr_backend_dx12)
 igr_configure_target(igr_backend_dx12)
 target_link_libraries(igr_backend_dx12 PUBLIC igr_core d3d12 dxgi)
-target_link_libraries(igr_backend_dx12 PUBLIC d3dcompiler d3d11 d2d1 dwrite)
+target_link_libraries(igr_backend_dx12 PUBLIC d3dcompiler)
 target_link_libraries(igr_backend_dx12 PRIVATE igr_shader_compiler)
 
 if(IGR_BUILD_EXAMPLES)
@@ -207,6 +207,15 @@ if(IGR_BUILD_EXAMPLES)
   target_link_libraries(igr_win32_dx12_sample PRIVATE igr_core igr_react_bridge igr_backend_dx12)
   if(IGR_ENABLE_HERMES)
     igr_copy_runtime_dlls(igr_win32_dx12_sample)
+  endif()
+
+  add_executable(igr_react_menu_harness WIN32
+    tests/menu/main.cpp
+  )
+  igr_configure_target(igr_react_menu_harness)
+  target_link_libraries(igr_react_menu_harness PRIVATE igr_core igr_react_bridge igr_backend_dx11)
+  if(IGR_ENABLE_HERMES)
+    igr_copy_runtime_dlls(igr_react_menu_harness)
   endif()
 endif()
 
@@ -297,4 +306,14 @@ if(IGR_BUILD_TESTS)
   igr_configure_target(igr_dx12_backend_tests)
   target_link_libraries(igr_dx12_backend_tests PRIVATE igr_core igr_backend_dx12)
   add_test(NAME igr_dx12_backend_tests COMMAND igr_dx12_backend_tests)
+
+  add_executable(igr_menu_runtime_tests
+    tests/menu/menu_runtime_tests.cpp
+  )
+  igr_configure_target(igr_menu_runtime_tests)
+  target_link_libraries(igr_menu_runtime_tests PRIVATE igr_core igr_react_bridge)
+  if(IGR_ENABLE_HERMES)
+    igr_copy_runtime_dlls(igr_menu_runtime_tests)
+  endif()
+  add_test(NAME igr_menu_runtime_tests COMMAND igr_menu_runtime_tests)
 endif()

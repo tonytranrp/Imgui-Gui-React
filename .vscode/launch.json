@@ -38,6 +38,16 @@
       "stopAtEntry": false
     },
     {
+      "name": "C++: React Menu Harness",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/b/igr_react_menu_harness.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
       "name": "C++: DX12 Contract Test",
       "type": "cppvsdbg",
       "request": "launch",

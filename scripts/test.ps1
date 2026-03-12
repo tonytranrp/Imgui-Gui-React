@@ -1,11 +1,18 @@
 param(
   [ValidateSet("Debug", "Release")]
-  [string]$Configuration = "Debug"
+  [string]$Configuration = "Debug",
+  [string]$BuildDirName
 )
 
 $ErrorActionPreference = "Stop"
 
-$buildDirName = if ($Configuration -eq "Debug") { "b-test" } else { "b-test-release" }
+$buildDirName = if (-not [string]::IsNullOrWhiteSpace($BuildDirName)) {
+  $BuildDirName
+} elseif ($Configuration -eq "Debug") {
+  "b"
+} else {
+  "b-release"
+}
 
 & (Join-Path $PSScriptRoot "build.ps1") -Configuration $Configuration -BuildDirName $buildDirName
 if ($LASTEXITCODE -ne 0) {
@@ -17,8 +24,12 @@ $buildDir = Join-Path $repoRoot $buildDirName
 $npmRoot = Join-Path $repoRoot "npm"
 
 Push-Location $npmRoot
-cmd /c "npm run export:fixtures"
+cmd /c "npm run build"
 $npmExitCode = $LASTEXITCODE
+if ($npmExitCode -eq 0) {
+  cmd /c "npm run export:fixtures"
+  $npmExitCode = $LASTEXITCODE
+}
 if ($npmExitCode -eq 0) {
   cmd /c "npm run hermes:bundle"
   if ($LASTEXITCODE -ne 0) {

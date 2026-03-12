@@ -68,7 +68,8 @@ int main() {
     return fail("failed to load the TSX-generated runtime fixture");
   }
 
-  igr::react::RuntimeDocumentBridge static_bridge(std::make_unique<igr::react::StaticTransportRuntime>(fixture_payload));
+  igr::react::RuntimeDocumentBridge static_bridge(std::make_unique<igr::react::StaticTransportRuntime>(fixture_payload),
+                                                  {.retain_last_envelope = true});
   RecordingRegistry resource_registry;
   status = static_bridge.initialize();
   if (!status) {
@@ -94,6 +95,57 @@ int main() {
     return fail("RuntimeDocumentBridge did not apply transport resources to the supplied registry");
   }
   static_bridge.shutdown();
+  if (resource_registry.removed_fonts.size() != fixture_envelope.fonts.size() ||
+      resource_registry.removed_images.size() != fixture_envelope.images.size() ||
+      resource_registry.removed_shaders.size() != fixture_envelope.shaders.size()) {
+    return fail("RuntimeDocumentBridge did not release applied transport resources during shutdown");
+  }
+
+  const std::string state_json = R"({"selectedPanel":"tools","buttonClicks":3})";
+  igr::react::RuntimeDocumentBridge state_bridge(std::make_unique<igr::react::StaticTransportRuntime>(
+      [fixture_payload, state_json](const igr::react::RuntimeFrameRequest& request, igr::react::RuntimeFrameResponse* response) {
+        if (request.state_json != state_json) {
+          return igr::Status::invalid_argument("RuntimeDocumentBridge did not forward the request state payload.");
+        }
+        response->sequence = request.frame.frame_index;
+        response->payload = fixture_payload;
+        return igr::Status::success();
+      }));
+  status = state_bridge.initialize();
+  if (!status) {
+    return fail("state runtime bridge initialization failed");
+  }
+  igr::FrameDocument state_document;
+  status = state_bridge.render_frame({
+                                          .frame = frame_info,
+                                          .state_json = state_json,
+                                      },
+                                      &state_document);
+  if (!status || state_document.widget_count() != expected_document.widget_count()) {
+    if (!status) {
+      std::cerr << status.message() << '\n';
+    }
+    state_bridge.shutdown();
+    return fail("RuntimeDocumentBridge did not preserve the request state while materializing the payload");
+  }
+  state_bridge.shutdown();
+
+  igr::react::RuntimeDocumentBridge out_of_sequence_bridge(std::make_unique<igr::react::StaticTransportRuntime>(
+      [fixture_payload](const igr::react::RuntimeFrameRequest& request, igr::react::RuntimeFrameResponse* response) {
+        response->sequence = request.frame.frame_index + 1;
+        response->payload = fixture_payload;
+        return igr::Status::success();
+      }));
+  status = out_of_sequence_bridge.initialize();
+  if (!status) {
+    return fail("out-of-sequence runtime bridge initialization failed");
+  }
+  igr::FrameDocument out_of_sequence_document;
+  status = out_of_sequence_bridge.render_frame(frame_info, &out_of_sequence_document);
+  out_of_sequence_bridge.shutdown();
+  if (status) {
+    return fail("RuntimeDocumentBridge accepted an out-of-sequence transport response");
+  }
 
   igr::react::TransportEnvelope reduced_envelope = fixture_envelope;
   if (!reduced_envelope.fonts.empty()) {
@@ -147,6 +199,64 @@ int main() {
   }
   delta_bridge.shutdown();
 
+  igr::react::TransportEnvelope retained_envelope = fixture_envelope;
+  retained_envelope.resource_mode = igr::react::TransportResourceMode::retain;
+  std::string retained_payload;
+  status = igr::react::serialize_transport_envelope(retained_envelope, &retained_payload);
+  if (!status) {
+    return fail("failed to serialize the retained transport envelope");
+  }
+
+  igr::react::TransportEnvelope retained_delta = fixture_envelope;
+  retained_delta.resource_mode = igr::react::TransportResourceMode::retain;
+  retained_delta.fonts.clear();
+  retained_delta.images.clear();
+  retained_delta.shaders.clear();
+  std::string retained_delta_payload;
+  status = igr::react::serialize_transport_envelope(retained_delta, &retained_delta_payload);
+  if (!status) {
+    return fail("failed to serialize the retained delta transport envelope");
+  }
+
+  igr::react::RuntimeDocumentBridge retained_bridge(std::make_unique<igr::react::StaticTransportRuntime>(
+      [retained_payload, retained_delta_payload](const igr::react::RuntimeFrameRequest& request, igr::react::RuntimeFrameResponse* response) {
+        response->sequence = request.frame.frame_index;
+        response->payload = request.frame.frame_index == 35 ? retained_delta_payload : retained_payload;
+        return igr::Status::success();
+      }));
+  RecordingRegistry retained_registry;
+  status = retained_bridge.initialize();
+  if (!status) {
+    return fail("retained runtime bridge initialization failed");
+  }
+  igr::FrameDocument retained_document;
+  status = retained_bridge.render_frame(frame_info, &retained_document, &retained_registry);
+  if (!status) {
+    retained_bridge.shutdown();
+    return fail("retained runtime bridge failed on the initial resource application");
+  }
+  status = retained_bridge.render_frame({
+                                          .frame_index = 35,
+                                          .viewport = frame_info.viewport,
+                                          .delta_seconds = frame_info.delta_seconds,
+                                      },
+                                      &retained_document,
+                                      &retained_registry);
+  if (!status) {
+    retained_bridge.shutdown();
+    return fail("retained runtime bridge failed on the retained resource update");
+  }
+  if (!retained_registry.removed_fonts.empty() || !retained_registry.removed_images.empty() || !retained_registry.removed_shaders.empty()) {
+    retained_bridge.shutdown();
+    return fail("RuntimeDocumentBridge should retain previously applied resources when the transport payload uses retain mode");
+  }
+  retained_bridge.shutdown();
+  if (retained_registry.removed_fonts.size() != fixture_envelope.fonts.size() ||
+      retained_registry.removed_images.size() != fixture_envelope.images.size() ||
+      retained_registry.removed_shaders.size() != fixture_envelope.shaders.size()) {
+    return fail("RuntimeDocumentBridge did not release retained resources during shutdown");
+  }
+
 #if IGR_ENABLE_HERMES
   const std::filesystem::path bundle_path = igr::tests::react_native_bundle_path();
   if (!std::filesystem::exists(bundle_path)) {
@@ -155,15 +265,20 @@ int main() {
     return 0;
   }
 
-  igr::react::RuntimeDocumentBridge hermes_bridge(std::make_unique<igr::react::HermesTransportRuntime>(igr::react::HermesRuntimeConfig{
-      .bundle = {
-          .bundle_path = bundle_path.string(),
-          .bytecode_path = igr::tests::react_native_bytecode_path().string(),
-          .entrypoint = "__igrRenderTransport",
-          .prefer_bytecode = false,
-      },
-      .enable_inspector = false,
-  }));
+  igr::react::RuntimeDocumentBridge hermes_bridge(
+      std::make_unique<igr::react::HermesTransportRuntime>(igr::react::HermesRuntimeConfig{
+          .bundle = {
+              .bundle_path = bundle_path.string(),
+              .bytecode_path = igr::tests::react_native_bytecode_path().string(),
+              .entrypoint = "__igrRenderTransport",
+              .prefer_bytecode = false,
+          },
+          .enable_inspector = false,
+      }),
+      {
+          .retain_last_envelope = true,
+          .retain_last_payload = true,
+      });
 
   status = hermes_bridge.initialize();
   if (!status) {
@@ -202,6 +317,58 @@ int main() {
   }
 
   hermes_bridge.shutdown();
+
+  const std::filesystem::path bytecode_path = igr::tests::react_native_bytecode_path();
+  if (std::filesystem::exists(bytecode_path)) {
+    igr::react::RuntimeDocumentBridge hermes_bytecode_bridge(
+        std::make_unique<igr::react::HermesTransportRuntime>(igr::react::HermesRuntimeConfig{
+            .bundle = {
+                .bundle_path = bundle_path.string(),
+                .bytecode_path = bytecode_path.string(),
+                .entrypoint = "__igrRenderTransport",
+                .prefer_bytecode = true,
+                .allow_source_fallback = false,
+            },
+            .enable_inspector = false,
+            .enable_gc_api = true,
+            .collect_garbage_after_initialize = true,
+            .collect_garbage_every_n_renders = 8,
+            .trim_working_set_after_gc = false,
+        }),
+        {
+            .retain_last_envelope = true,
+            .retain_last_payload = true,
+        });
+
+    status = hermes_bytecode_bridge.initialize();
+    if (!status) {
+      std::cerr << status.message() << '\n';
+      return fail("Hermes bytecode runtime bridge initialization failed");
+    }
+
+    for (std::uint64_t index = 0; index < 32; ++index) {
+      const igr::FrameInfo bytecode_frame{
+          .frame_index = frame_info.frame_index + index,
+          .viewport = frame_info.viewport,
+          .delta_seconds = frame_info.delta_seconds,
+          .time_seconds = static_cast<double>(index) * frame_info.delta_seconds,
+      };
+      status = hermes_bytecode_bridge.render_frame(bytecode_frame, &hermes_document);
+      if (!status) {
+        std::cerr << status.message() << '\n';
+        hermes_bytecode_bridge.shutdown();
+        return fail("Hermes bytecode runtime bridge failed during repeated renders");
+      }
+    }
+
+    if (hermes_document.widget_count() != expected_document.widget_count() ||
+        hermes_bytecode_bridge.last_envelope().session.name != fixture_envelope.session.name) {
+      hermes_bytecode_bridge.shutdown();
+      return fail("Hermes bytecode runtime bridge did not preserve the expected runtime state");
+    }
+
+    hermes_bytecode_bridge.shutdown();
+  }
 #else
   igr::react::HermesTransportRuntime hermes_runtime({
       .bundle = {

@@ -110,6 +110,28 @@ bool parse_input_mode(std::string_view value, InputMode* mode) {
   return false;
 }
 
+std::string_view to_string(TransportResourceMode mode) noexcept {
+  switch (mode) {
+    case TransportResourceMode::replace:
+      return "replace";
+    case TransportResourceMode::retain:
+      return "retain";
+  }
+  return "replace";
+}
+
+bool parse_resource_mode(std::string_view value, TransportResourceMode* mode) {
+  if (value == "replace") {
+    *mode = TransportResourceMode::replace;
+    return true;
+  }
+  if (value == "retain") {
+    *mode = TransportResourceMode::retain;
+    return true;
+  }
+  return false;
+}
+
 bool parse_font_weight(std::string_view value, FontWeight* weight) {
   if (value == "regular") {
     *weight = FontWeight::regular;
@@ -280,6 +302,12 @@ class JsonParser {
           envelope->sequence = static_cast<std::uint64_t>(std::max(*double_value, 0.0));
         } else {
           return Status::invalid_argument("Transport sequence must be numeric.");
+        }
+      } else if (field_name == "resourceMode") {
+        std::string value;
+        status = parse_string(&value);
+        if (status && !parse_resource_mode(value, &envelope->resource_mode)) {
+          return Status::invalid_argument("Unsupported resourceMode value in transport payload.");
         }
       } else if (field_name == "root") {
         status = parse_element(&envelope->root);
@@ -1585,7 +1613,9 @@ Status serialize_transport_envelope(const TransportEnvelope& envelope, std::stri
   *payload += escape_json(envelope.kind);
   *payload += "\",\"sequence\":";
   *payload += std::to_string(envelope.sequence);
-  *payload += ",\"session\":";
+  *payload += ",\"resourceMode\":\"";
+  *payload += std::string(to_string(envelope.resource_mode));
+  *payload += "\",\"session\":";
   append_session_json(envelope.session, *payload);
   *payload += ",\"fonts\":";
   append_fonts_json(envelope.fonts, *payload);
@@ -1615,28 +1645,60 @@ Status materialize_transport_envelope(std::string_view payload, FrameBuilder& bu
   return materialize_transport_envelope(envelope, builder);
 }
 
+namespace {
+
+void rollback_registered_resources(const std::vector<std::string_view>& fonts,
+                                   const std::vector<std::string_view>& images,
+                                   const std::vector<std::string_view>& shaders,
+                                   IResourceRegistry& registry) noexcept {
+  for (auto it = shaders.rbegin(); it != shaders.rend(); ++it) {
+    registry.unregister_shader(*it);
+  }
+  for (auto it = images.rbegin(); it != images.rend(); ++it) {
+    registry.unregister_image(*it);
+  }
+  for (auto it = fonts.rbegin(); it != fonts.rend(); ++it) {
+    registry.unregister_font(*it);
+  }
+}
+
+}  // namespace
+
 Status apply_transport_resources(const TransportEnvelope& envelope, IResourceRegistry& registry) {
   if (envelope.kind != "igr.document.v1") {
     return Status::invalid_argument("Unsupported transport kind: " + envelope.kind);
   }
 
+  std::vector<std::string_view> applied_fonts;
+  std::vector<std::string_view> applied_images;
+  std::vector<std::string_view> applied_shaders;
+  applied_fonts.reserve(envelope.fonts.size());
+  applied_images.reserve(envelope.images.size());
+  applied_shaders.reserve(envelope.shaders.size());
+
   for (const auto& font : envelope.fonts) {
     Status status = registry.register_font(font.key, font.descriptor);
     if (!status) {
+      rollback_registered_resources(applied_fonts, applied_images, applied_shaders, registry);
       return status;
     }
+    applied_fonts.push_back(font.key);
   }
   for (const auto& image : envelope.images) {
     Status status = registry.register_image(image.key, image.descriptor);
     if (!status) {
+      rollback_registered_resources(applied_fonts, applied_images, applied_shaders, registry);
       return status;
     }
+    applied_images.push_back(image.key);
   }
   for (const auto& shader : envelope.shaders) {
     Status status = registry.register_shader(shader.key, shader.descriptor);
     if (!status) {
+      rollback_registered_resources(applied_fonts, applied_images, applied_shaders, registry);
       return status;
     }
+    applied_shaders.push_back(shader.key);
   }
   return Status::success();
 }
@@ -1646,8 +1708,43 @@ Status reconcile_transport_resources(const TransportEnvelope& previous, const Tr
     return Status::invalid_argument("Unsupported transport kind: " + current.kind);
   }
 
+  if (current.resource_mode == TransportResourceMode::retain) {
+    return apply_transport_resources(current, registry);
+  }
+
   Status status = apply_transport_resources(current, registry);
   if (!status) {
+    const Status restore_status = apply_transport_resources(previous, registry);
+    if (restore_status) {
+      auto has_previous_font = [&](std::string_view key) {
+        return std::find_if(previous.fonts.begin(), previous.fonts.end(),
+                            [&](const TransportFontResource& font) { return font.key == key; }) != previous.fonts.end();
+      };
+      auto has_previous_image = [&](std::string_view key) {
+        return std::find_if(previous.images.begin(), previous.images.end(),
+                            [&](const TransportImageResource& image) { return image.key == key; }) != previous.images.end();
+      };
+      auto has_previous_shader = [&](std::string_view key) {
+        return std::find_if(previous.shaders.begin(), previous.shaders.end(),
+                            [&](const TransportShaderResource& shader) { return shader.key == key; }) != previous.shaders.end();
+      };
+
+      for (const auto& font : current.fonts) {
+        if (!has_previous_font(font.key)) {
+          registry.unregister_font(font.key);
+        }
+      }
+      for (const auto& image : current.images) {
+        if (!has_previous_image(image.key)) {
+          registry.unregister_image(image.key);
+        }
+      }
+      for (const auto& shader : current.shaders) {
+        if (!has_previous_shader(shader.key)) {
+          registry.unregister_shader(shader.key);
+        }
+      }
+    }
     return status;
   }
 

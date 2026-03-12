@@ -86,6 +86,7 @@ export interface LineProps extends DocumentProps {
 
 export type ShaderLanguage = "hlsl" | "glsl";
 export type ShaderBlendMode = "alpha" | "opaque" | "additive";
+export type TransportResourceMode = "replace" | "retain";
 
 export interface TransportShaderStage {
   language: ShaderLanguage;
@@ -171,6 +172,7 @@ export interface TransportImageResource extends ImageResourceDesc {
 export interface TransportEnvelope {
   kind: "igr.document.v1";
   sequence: number;
+  resourceMode?: TransportResourceMode;
   session?: TransportSession;
   fonts?: TransportFontResource[];
   images?: TransportImageResource[];
@@ -180,6 +182,7 @@ export interface TransportEnvelope {
 
 export interface TransportEnvelopeOptions {
   session?: TransportSession;
+  resourceMode?: TransportResourceMode;
   fonts?: TransportFontResource[];
   images?: TransportImageResource[];
   shaders?: TransportShaderResource[];
@@ -270,6 +273,7 @@ export function createTransportEnvelope(
   return {
     kind: "igr.document.v1",
     sequence,
+    ...(options.resourceMode !== undefined ? { resourceMode: options.resourceMode } : {}),
     ...(options.session !== undefined ? { session: options.session } : {}),
     ...(options.fonts !== undefined ? { fonts: options.fonts } : {}),
     ...(options.images !== undefined ? { images: options.images } : {}),

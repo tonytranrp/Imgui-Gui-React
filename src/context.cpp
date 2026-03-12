@@ -21,7 +21,7 @@ WidgetId fnv_append(WidgetId hash, std::string_view text) noexcept {
   return hash;
 }
 
-WidgetId make_widget_id(const std::vector<WidgetId>& scope_ids, WidgetKind kind, std::string_view key) noexcept {
+WidgetId make_widget_id(const std::vector<WidgetId>& scope_ids, WidgetKind kind, std::string_view key, std::size_t sibling_ordinal) noexcept {
   WidgetId hash = kFnvOffset;
   for (const auto scope_id : scope_ids) {
     std::array<char, 17> buffer{};
@@ -32,7 +32,18 @@ WidgetId make_widget_id(const std::vector<WidgetId>& scope_ids, WidgetKind kind,
   }
 
   hash = fnv_append(hash, to_string(kind));
-  hash = fnv_append(hash, key.empty() ? "<anonymous>" : key);
+  if (!key.empty()) {
+    hash = fnv_append(hash, key);
+    return hash;
+  }
+
+  hash = fnv_append(hash, "<anonymous>#");
+  std::array<char, 21> ordinal_buffer{};
+  const auto [ordinal_ptr, ordinal_ec] =
+      std::to_chars(ordinal_buffer.data(), ordinal_buffer.data() + ordinal_buffer.size(), sibling_ordinal, 10);
+  if (ordinal_ec == std::errc{}) {
+    hash = fnv_append(hash, std::string_view(ordinal_buffer.data(), static_cast<std::size_t>(ordinal_ptr - ordinal_buffer.data())));
+  }
   return hash;
 }
 
@@ -91,10 +102,10 @@ Status FrameBuilder::begin_stack(std::string_view key, Axis axis) {
 Status FrameBuilder::begin_clip_rect(std::string_view key, ExtentF extent) {
   std::vector<WidgetAttribute> attributes;
   attributes.reserve(2);
-  if (extent.x > 0.0f) {
+  if (extent.x >= 0.0f) {
     attributes.push_back({"width", format_number(extent.x)});
   }
-  if (extent.y > 0.0f) {
+  if (extent.y >= 0.0f) {
     attributes.push_back({"height", format_number(extent.y)});
   }
   return push_container(WidgetKind::clip_rect, key, {}, std::move(attributes));
@@ -255,6 +266,7 @@ Status FrameBuilder::end_container() {
 
   stack_.pop_back();
   scope_ids_.pop_back();
+  child_ordinals_.pop_back();
   return Status::success();
 }
 
@@ -262,6 +274,7 @@ void FrameBuilder::reset(FrameDocument* document) {
   document_ = document;
   stack_.clear();
   scope_ids_.clear();
+  child_ordinals_.assign(1, 0);
 }
 
 std::size_t FrameBuilder::open_container_count() const noexcept {
@@ -271,6 +284,7 @@ std::size_t FrameBuilder::open_container_count() const noexcept {
 void FrameBuilder::force_close() {
   stack_.clear();
   scope_ids_.clear();
+  child_ordinals_.assign(document_ != nullptr ? 1 : 0, 0);
 }
 
 Status FrameBuilder::push_container(
@@ -286,12 +300,14 @@ Status FrameBuilder::push_container(
   node.kind = kind;
   node.key = std::string(key);
   node.label = std::string(label);
-  node.id = make_widget_id(scope_ids_, kind, key);
+  const std::size_t sibling_ordinal = child_ordinals_.empty() ? 0 : child_ordinals_.back()++;
+  node.id = make_widget_id(scope_ids_, kind, key, sibling_ordinal);
   node.attributes = std::move(attributes);
 
   WidgetNode& inserted = append_node(*document_, stack_, std::move(node));
   stack_.push_back(&inserted);
   scope_ids_.push_back(inserted.id);
+  child_ordinals_.push_back(0);
   return Status::success();
 }
 
@@ -308,7 +324,8 @@ Status FrameBuilder::push_leaf(
   node.kind = kind;
   node.key = std::string(key);
   node.label = std::string(label);
-  node.id = make_widget_id(scope_ids_, kind, key);
+  const std::size_t sibling_ordinal = child_ordinals_.empty() ? 0 : child_ordinals_.back()++;
+  node.id = make_widget_id(scope_ids_, kind, key, sibling_ordinal);
   node.attributes = std::move(attributes);
 
   append_node(*document_, stack_, std::move(node));

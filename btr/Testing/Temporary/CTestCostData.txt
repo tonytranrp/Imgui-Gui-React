@@ -1,0 +1,14 @@
+igr_core_tests 2 0.0323327
+igr_react_bridge_tests 2 0.0238126
+igr_react_transport_tests 2 0.0246459
+igr_react_runtime_bridge_tests 1 0
+igr_interaction_tests 2 0.0240407
+igr_shader_compiler_tests 2 0.0764421
+igr_dx11_backend_tests 1 0.411458
+igr_dx11_external_host_tests 2 0.159464
+igr_dx12_contract_tests 2 0.190259
+igr_dx12_backend_tests 0 0
+igr_menu_runtime_tests 2 0.03894
+---
+igr_react_runtime_bridge_tests
+igr_dx12_backend_tests

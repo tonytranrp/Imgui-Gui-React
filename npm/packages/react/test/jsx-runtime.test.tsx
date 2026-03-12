@@ -45,11 +45,13 @@ test("renderTransportDocument emits the native bridge envelope", () => {
         presentationMode: "host_managed"
       }
     },
+    resourceMode: "retain",
     fonts: [{ key: "mono-sm", family: "Consolas", size: 13 }]
   });
   assert.match(payload, /igr\.document\.v1/);
   assert.match(payload, /mono-sm/);
   assert.match(payload, /"sequence":3/);
+  assert.match(payload, /"resourceMode":"retain"/);
   assert.match(payload, /transport-test/);
   assert.match(payload, /injected_overlay/);
 });

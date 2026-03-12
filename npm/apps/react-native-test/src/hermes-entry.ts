@@ -1,5 +1,7 @@
 import { createPhysicsTransportPayload, type PhysicsFrameRequest } from "./index.js";
 
+let publishedResources = false;
+
 export type HermesFrameRequest = PhysicsFrameRequest;
 
 declare global {
@@ -11,7 +13,12 @@ declare global {
 }
 
 export function renderTransportForHermes(request: HermesFrameRequest = {}): string {
-  return createPhysicsTransportPayload(request);
+  const payload = createPhysicsTransportPayload(request, {
+    includeResources: !publishedResources,
+    resourceMode: "retain"
+  });
+  publishedResources = true;
+  return payload;
 }
 
 globalThis.__igrRenderTransport = renderTransportForHermes;

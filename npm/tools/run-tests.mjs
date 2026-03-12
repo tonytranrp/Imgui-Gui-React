@@ -4,9 +4,11 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(rootDir, "../..");
 const workspaceDirs = [
   path.resolve(rootDir, "../packages"),
-  path.resolve(rootDir, "../apps")
+  path.resolve(rootDir, "../apps"),
+  path.resolve(repoRoot, "tests/menu/dist")
 ];
 
 async function walk(directory, files = []) {
