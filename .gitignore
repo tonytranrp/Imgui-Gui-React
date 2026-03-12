@@ -1,5 +1,6 @@
 build/
 b/
+b-*/
 b-release/
 .cache/
 out/
