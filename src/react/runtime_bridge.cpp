@@ -49,7 +49,7 @@ Status RuntimeDocumentBridge::initialize() {
   return status;
 }
 
-Status RuntimeDocumentBridge::render_frame(FrameInfo frame, FrameDocument* document) {
+Status RuntimeDocumentBridge::render_frame(FrameInfo frame, FrameDocument* document, IResourceRegistry* resource_registry) {
   if (document == nullptr) {
     return Status::invalid_argument("RuntimeDocumentBridge requires a valid output document.");
   }
@@ -67,6 +67,16 @@ Status RuntimeDocumentBridge::render_frame(FrameInfo frame, FrameDocument* docum
   status = parse_transport_envelope(last_payload_, &last_envelope_);
   if (!status) {
     return status;
+  }
+
+  if (resource_registry != nullptr) {
+    status = has_applied_resources_ ? reconcile_transport_resources(applied_resources_, last_envelope_, *resource_registry)
+                                    : apply_transport_resources(last_envelope_, *resource_registry);
+    if (!status) {
+      return status;
+    }
+    applied_resources_ = last_envelope_;
+    has_applied_resources_ = true;
   }
 
   UiContext context;
@@ -89,8 +99,10 @@ void RuntimeDocumentBridge::shutdown() noexcept {
     runtime_->shutdown();
   }
   initialized_ = false;
+  applied_resources_ = {};
   last_envelope_ = {};
   last_payload_.clear();
+  has_applied_resources_ = false;
 }
 
 bool RuntimeDocumentBridge::initialized() const noexcept {

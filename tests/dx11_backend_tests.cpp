@@ -244,6 +244,12 @@ int main() {
   }
 
   igr::backends::Dx11Backend backend({
+      .diagnostics = {
+          .memory_sample_interval = 8,
+      },
+      .resource_budgets = {
+          .max_cached_wide_strings = 0,
+      },
       .window_handle = window_handle,
       .initial_viewport = {320, 240},
       .enable_debug_layer = true,
@@ -400,6 +406,16 @@ int main() {
     DestroyWindow(window_handle);
     UnregisterClassW(class_name, instance);
     return fail("backend frame stats did not capture the first DX11 frame");
+  }
+
+  const auto telemetry = backend.telemetry();
+  if (telemetry.frame.widget_count != document.widget_count() || telemetry.resources.font_count == 0 || telemetry.resources.image_count == 0 ||
+      telemetry.resources.shader_count == 0 || telemetry.resources.texture_count == 0 || telemetry.resources.wide_text_cache_bytes != 0 ||
+      telemetry.scopes.empty()) {
+    backend.shutdown();
+    DestroyWindow(window_handle);
+    UnregisterClassW(class_name, instance);
+    return fail("backend telemetry did not capture DX11 resource or scope diagnostics");
   }
 
   status = backend.resize({480, 320});

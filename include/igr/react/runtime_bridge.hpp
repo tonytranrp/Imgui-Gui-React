@@ -5,6 +5,7 @@
 #include <string>
 
 #include "igr/frame.hpp"
+#include "igr/resources.hpp"
 #include "igr/react/transport.hpp"
 #include "igr/result.hpp"
 
@@ -50,7 +51,7 @@ class RuntimeDocumentBridge final {
   explicit RuntimeDocumentBridge(std::unique_ptr<ITransportRuntime> runtime);
 
   Status initialize();
-  Status render_frame(FrameInfo frame, FrameDocument* document);
+  Status render_frame(FrameInfo frame, FrameDocument* document, IResourceRegistry* resource_registry = nullptr);
   void shutdown() noexcept;
 
   [[nodiscard]] bool initialized() const noexcept;
@@ -59,9 +60,11 @@ class RuntimeDocumentBridge final {
 
  private:
   std::unique_ptr<ITransportRuntime> runtime_;
+  TransportEnvelope applied_resources_{};
   TransportEnvelope last_envelope_{};
   std::string last_payload_{};
   bool initialized_{false};
+  bool has_applied_resources_{false};
 };
 
 }  // namespace igr::react

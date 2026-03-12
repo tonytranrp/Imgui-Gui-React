@@ -19,6 +19,7 @@
 #include <d3d11.h>
 #include <d3d11on12.h>
 #include <d3dcompiler.h>
+#include <d3d12sdklayers.h>
 #include <dwrite.h>
 #include <wrl/client.h>
 
@@ -79,6 +80,16 @@ struct DrawBatch {
   std::optional<Rect> clip_rect;
 };
 
+constexpr std::string_view kInternalTextAtlasKey = "__igr_internal_text_atlas";
+
+struct TextAtlasPlacement {
+  const TextLabel* label{};
+  std::uint32_t atlas_x{};
+  std::uint32_t atlas_y{};
+  std::uint32_t width{};
+  std::uint32_t height{};
+};
+
 struct ShaderConstants {
   ShaderVector4 tint{1.0f, 1.0f, 1.0f, 1.0f};
   std::array<ShaderVector4, 4> params{
@@ -95,6 +106,12 @@ struct ShaderConstants {
 struct Dx12CompiledShader {
   ShaderResourceDesc descriptor;
   ComPtr<ID3D12PipelineState> pipeline_state;
+};
+
+struct ScopeAccumulator {
+  std::uint64_t call_count{};
+  std::uint64_t total_microseconds{};
+  std::uint64_t max_microseconds{};
 };
 
 struct OwnedFrameResources {
@@ -128,6 +145,45 @@ std::string device_error_message(ID3D12Device* device, const char* prefix, HRESU
   return message;
 }
 
+std::string recent_debug_messages(ID3D12Device* device, std::uint64_t max_messages = 8) {
+  if (device == nullptr) {
+    return {};
+  }
+  ComPtr<ID3D12InfoQueue> info_queue;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&info_queue))) || !info_queue) {
+    return {};
+  }
+
+  const UINT64 total_messages = info_queue->GetNumStoredMessagesAllowedByRetrievalFilter();
+  if (total_messages == 0) {
+    return {};
+  }
+
+  const UINT64 start_index = total_messages > max_messages ? total_messages - max_messages : 0;
+  std::ostringstream stream;
+  for (UINT64 index = start_index; index < total_messages; ++index) {
+    SIZE_T message_size = 0;
+    if (FAILED(info_queue->GetMessage(index, nullptr, &message_size)) || message_size == 0) {
+      continue;
+    }
+    std::vector<std::byte> storage(message_size);
+    auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+    if (FAILED(info_queue->GetMessage(index, message, &message_size)) || message == nullptr) {
+      continue;
+    }
+    if (stream.tellp() == std::streampos(0)) {
+      stream << " [d3d12:";
+    } else {
+      stream << " | ";
+    }
+    stream << static_cast<int>(message->Severity) << ":" << static_cast<int>(message->ID) << " " << message->pDescription;
+  }
+  if (stream.tellp() != std::streampos(0)) {
+    stream << "]";
+  }
+  return stream.str();
+}
+
 bool same_extent(ExtentU lhs, ExtentU rhs) noexcept {
   return lhs.width == rhs.width && lhs.height == rhs.height;
 }
@@ -146,6 +202,15 @@ std::wstring wide(std::string_view text) {
     MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), count);
   }
   return out;
+}
+
+const std::wstring& cache_wide_text(StringMap<std::wstring>& cache, std::string_view text) {
+  const auto cached = cache.find(text);
+  if (cached != cache.end()) {
+    return cached->second;
+  }
+  auto [inserted, _] = cache.emplace(std::string(text), wide(text));
+  return inserted->second;
 }
 
 std::string_view attr_string(const WidgetNode& node, std::string_view name, std::string_view fallback = {}) {
@@ -199,6 +264,110 @@ Status validate_image_descriptor(std::string_view backend_name, const ImageResou
     return Status::invalid_argument(std::string(backend_name) + " image registration requires finite non-negative UV coordinates.");
   }
   return Status::success();
+}
+
+void record_scope(StringMap<ScopeAccumulator>& scopes, std::string_view name, std::uint64_t duration_microseconds) {
+  auto [it, _] = scopes.try_emplace(std::string(name), ScopeAccumulator{});
+  ScopeAccumulator& scope = it->second;
+  scope.call_count += 1;
+  scope.total_microseconds += duration_microseconds;
+  scope.max_microseconds = (std::max)(scope.max_microseconds, duration_microseconds);
+}
+
+std::uint64_t estimate_font_format_bytes(const StringMap<ComPtr<IDWriteTextFormat>>& formats) {
+  return static_cast<std::uint64_t>(formats.size()) * sizeof(IDWriteTextFormat*);
+}
+
+std::uint64_t estimate_wide_text_cache_bytes(const StringMap<std::wstring>& cache) {
+  std::uint64_t total = 0;
+  for (const auto& [key, value] : cache) {
+    total += static_cast<std::uint64_t>(key.capacity());
+    total += static_cast<std::uint64_t>(value.capacity()) * sizeof(wchar_t);
+  }
+  return total;
+}
+
+std::uint64_t estimate_scene_bytes(const Scene& scene) {
+  return static_cast<std::uint64_t>(scene.quads.capacity()) * sizeof(Quad) + static_cast<std::uint64_t>(scene.labels.capacity()) * sizeof(TextLabel);
+}
+
+std::uint64_t estimate_d3d12_resource_bytes(ID3D12Resource* resource) {
+  if (resource == nullptr) {
+    return 0;
+  }
+  return static_cast<std::uint64_t>(resource->GetDesc().Width);
+}
+
+std::uint64_t estimate_bitmap_bytes(std::uint32_t width, std::uint32_t height) {
+  return static_cast<std::uint64_t>(width) * static_cast<std::uint64_t>(height) * 4u;
+}
+
+std::uint32_t next_power_of_two(std::uint32_t value) {
+  std::uint32_t power = 1;
+  while (power < value) {
+    power <<= 1u;
+  }
+  return power;
+}
+
+void trim_wide_text_cache(StringMap<std::wstring>& cache, const ResourceBudgetConfig& budgets) {
+  if (budgets.max_cached_wide_strings == 0) {
+    cache.clear();
+    detail::release_storage(cache);
+    return;
+  }
+  if (cache.size() <= budgets.max_cached_wide_strings) {
+    return;
+  }
+  cache.clear();
+  detail::release_storage(cache);
+}
+
+template <typename T>
+void trim_vector_capacity(std::vector<T>& storage, std::size_t max_retained) {
+  if (max_retained == 0) {
+    storage.clear();
+    detail::release_storage(storage);
+    return;
+  }
+  if (storage.capacity() <= max_retained * 2) {
+    return;
+  }
+  std::vector<T> trimmed;
+  trimmed.reserve((std::max)(storage.size(), max_retained));
+  for (auto& item : storage) {
+    trimmed.push_back(std::move(item));
+  }
+  storage.swap(trimmed);
+}
+
+void trim_scratch_storage(Scene& scene,
+                          std::vector<QuadVertex>& vertices,
+                          std::vector<DrawBatch>& batches,
+                          const ResourceBudgetConfig& budgets) {
+  trim_vector_capacity(scene.quads, budgets.max_retained_scene_quads);
+  trim_vector_capacity(scene.labels, budgets.max_retained_text_labels);
+  trim_vector_capacity(vertices, budgets.max_retained_vertices);
+  trim_vector_capacity(batches, budgets.max_retained_batches);
+}
+
+IDXGIAdapter* resolve_dxgi_adapter(ID3D12Device* device,
+                                   IDXGIFactory4* existing_factory,
+                                   ComPtr<IDXGIFactory4>& owned_factory,
+                                   ComPtr<IDXGIAdapter>& adapter) {
+  if (device == nullptr) {
+    return nullptr;
+  }
+  if (existing_factory != nullptr) {
+    owned_factory = existing_factory;
+  } else if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&owned_factory)))) {
+    return nullptr;
+  }
+  const LUID luid = device->GetAdapterLuid();
+  if (FAILED(owned_factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
+    return nullptr;
+  }
+  return adapter.Get();
 }
 
 std::optional<float> attr_float(const WidgetNode& node, std::string_view name) {
@@ -1019,6 +1188,24 @@ class Dx12Backend::Impl {
   ComPtr<ID3D12Resource> shader_constant_buffer;
   std::byte* shader_constant_buffer_mapped{};
   std::size_t shader_constant_capacity{};
+  ComPtr<ID3D12DescriptorHeap> text_atlas_heap;
+  ComPtr<ID3D12Resource> text_atlas_texture;
+  ComPtr<ID3D12Resource> text_atlas_upload;
+  std::byte* text_atlas_upload_mapped{};
+  std::uint64_t text_atlas_upload_size{};
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT text_atlas_upload_footprint{};
+  D3D12_RESOURCE_STATES text_atlas_state{D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  D3D12_CPU_DESCRIPTOR_HANDLE text_atlas_cpu_descriptor{};
+  D3D12_GPU_DESCRIPTOR_HANDLE text_atlas_gpu_descriptor{};
+  std::uint32_t text_atlas_width{};
+  std::uint32_t text_atlas_height{};
+  HDC text_bitmap_dc{};
+  HBITMAP text_bitmap_handle{};
+  HBITMAP text_bitmap_previous{};
+  void* text_bitmap_bits{};
+  std::uint32_t text_bitmap_width{};
+  std::uint32_t text_bitmap_height{};
+  StringMap<HFONT> gdi_fonts;
   ComPtr<ID3D11Device> interop_device;
   ComPtr<ID3D11DeviceContext> interop_context;
   ComPtr<ID3D11On12Device> on12_device;
@@ -1035,14 +1222,20 @@ class Dx12Backend::Impl {
   std::size_t vertex_capacity{};
   StringMap<FontResourceDesc> font_descriptors;
   StringMap<ComPtr<IDWriteTextFormat>> font_formats;
+  StringMap<std::wstring> wide_text_cache;
   StringMap<ImageResourceDesc> image_resources;
   StringMap<ShaderResourceDesc> shader_descriptors;
   StringMap<Dx12CompiledShader> shaders;
   StringMap<Dx12TextureBinding> textures;
   BackendFrameStats stats{};
+  BackendTelemetrySnapshot telemetry{};
+  StringMap<ScopeAccumulator> scope_totals;
+  std::uint64_t telemetry_refresh_count{};
   bool text_interop_available{false};
+  std::uint32_t textless_frame_streak{};
   bool owned_command_list_executed{false};
   Scene scratch_scene;
+  std::vector<TextAtlasPlacement> scratch_text_placements;
   std::vector<QuadVertex> scratch_vertices;
   std::vector<DrawBatch> scratch_batches;
 };
@@ -1051,6 +1244,93 @@ void clear_owned_frame_state(Dx12Backend::Impl& impl) noexcept {
   impl.owned_frame_pending = false;
   impl.owned_command_list_executed = false;
   impl.owned_pending_frame_index = 0;
+}
+
+void clear_gdi_fonts(Dx12Backend::Impl& impl) noexcept {
+  for (auto& [_, font] : impl.gdi_fonts) {
+    if (font != nullptr) {
+      DeleteObject(font);
+    }
+  }
+  impl.gdi_fonts.clear();
+}
+
+void reset_text_bitmap_state(Dx12Backend::Impl& impl) noexcept {
+  if (impl.text_bitmap_dc != nullptr && impl.text_bitmap_previous != nullptr) {
+    SelectObject(impl.text_bitmap_dc, impl.text_bitmap_previous);
+    impl.text_bitmap_previous = nullptr;
+  }
+  if (impl.text_bitmap_handle != nullptr) {
+    DeleteObject(impl.text_bitmap_handle);
+    impl.text_bitmap_handle = nullptr;
+  }
+  if (impl.text_bitmap_dc != nullptr) {
+    DeleteDC(impl.text_bitmap_dc);
+    impl.text_bitmap_dc = nullptr;
+  }
+  impl.text_bitmap_bits = nullptr;
+  impl.text_bitmap_width = 0;
+  impl.text_bitmap_height = 0;
+}
+
+void reset_text_atlas_resources(Dx12Backend::Impl& impl) noexcept {
+  if (impl.text_atlas_upload && impl.text_atlas_upload_mapped != nullptr) {
+    impl.text_atlas_upload->Unmap(0, nullptr);
+    impl.text_atlas_upload_mapped = nullptr;
+  }
+  impl.text_atlas_heap.Reset();
+  impl.text_atlas_texture.Reset();
+  impl.text_atlas_upload.Reset();
+  impl.text_atlas_upload_size = 0;
+  impl.text_atlas_upload_footprint = {};
+  impl.text_atlas_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  impl.text_atlas_cpu_descriptor = {};
+  impl.text_atlas_gpu_descriptor = {};
+  impl.text_atlas_width = 0;
+  impl.text_atlas_height = 0;
+}
+
+void reset_text_atlas_upload_buffer(Dx12Backend::Impl& impl) noexcept {
+  if (impl.text_atlas_upload && impl.text_atlas_upload_mapped != nullptr) {
+    impl.text_atlas_upload->Unmap(0, nullptr);
+    impl.text_atlas_upload_mapped = nullptr;
+  }
+  impl.text_atlas_upload.Reset();
+  impl.text_atlas_upload_size = 0;
+  impl.text_atlas_upload_footprint = {};
+}
+
+int to_gdi_weight(FontWeight weight) noexcept {
+  switch (weight) {
+    case FontWeight::regular:
+      return FW_NORMAL;
+    case FontWeight::medium:
+      return 500;
+    case FontWeight::semibold:
+      return FW_SEMIBOLD;
+    case FontWeight::bold:
+      return FW_BOLD;
+  }
+  return FW_NORMAL;
+}
+
+std::uint32_t resolve_text_dpi(HDC dc) noexcept {
+  constexpr std::uint32_t kFallbackDpi = 96;
+  if (dc == nullptr) {
+    return kFallbackDpi;
+  }
+  const int dpi = GetDeviceCaps(dc, LOGPIXELSY);
+  return dpi > 0 ? static_cast<std::uint32_t>(dpi) : kFallbackDpi;
+}
+
+std::uint32_t rgba_row_pitch(std::uint32_t width) noexcept {
+  return (width * 4u + 255u) & ~255u;
+}
+
+void reset_text_atlas_state(Dx12Backend::Impl& impl) noexcept {
+  impl.textures.erase(std::string(kInternalTextAtlasKey));
+  reset_text_atlas_resources(impl);
+  impl.scratch_text_placements.clear();
 }
 
 DWRITE_FONT_WEIGHT to_dwrite_weight(FontWeight weight) noexcept {
@@ -1075,6 +1355,466 @@ DWRITE_FONT_STYLE to_dwrite_style(FontStyle style) noexcept {
       return DWRITE_FONT_STYLE_ITALIC;
   }
   return DWRITE_FONT_STYLE_NORMAL;
+}
+
+HFONT resolve_gdi_font(Dx12Backend::Impl& impl,
+                       const Dx12BackendConfig& config,
+                       const TextLabel& label) {
+  std::string key;
+  std::wstring family;
+  float size = config.theme.body_text_size;
+  int weight = FW_NORMAL;
+  bool italic = false;
+
+  if (!label.font_key.empty()) {
+    key = std::string(label.font_key);
+    const auto descriptor_it = impl.font_descriptors.find(label.font_key);
+    if (descriptor_it != impl.font_descriptors.end()) {
+      const FontResourceDesc& descriptor = descriptor_it->second;
+      family = wide(descriptor.family.empty() ? std::string_view("Segoe UI") : std::string_view(descriptor.family));
+      size = descriptor.size > 0.0f ? descriptor.size : config.theme.body_text_size;
+      weight = to_gdi_weight(descriptor.weight);
+      italic = descriptor.style == FontStyle::italic;
+    }
+  } else {
+    switch (label.style) {
+      case TextStyle::title:
+        key = "__title__";
+        family = L"Segoe UI";
+        size = config.theme.title_text_size;
+        weight = FW_SEMIBOLD;
+        break;
+      case TextStyle::center:
+        key = "__center__";
+        family = L"Segoe UI";
+        size = config.theme.body_text_size;
+        weight = FW_SEMIBOLD;
+        break;
+      case TextStyle::body:
+        key = "__body__";
+        family = L"Segoe UI";
+        size = config.theme.body_text_size;
+        weight = FW_NORMAL;
+        break;
+    }
+  }
+
+  if (family.empty()) {
+    family = L"Segoe UI";
+  }
+
+  const auto cached = impl.gdi_fonts.find(key);
+  if (cached != impl.gdi_fonts.end()) {
+    return cached->second;
+  }
+
+  if (impl.text_bitmap_dc == nullptr) {
+    return nullptr;
+  }
+
+  const int height = -MulDiv(static_cast<int>(std::lround(size)), static_cast<int>(resolve_text_dpi(impl.text_bitmap_dc)), 72);
+  HFONT font = CreateFontW(
+      height,
+      0,
+      0,
+      0,
+      weight,
+      italic ? TRUE : FALSE,
+      FALSE,
+      FALSE,
+      DEFAULT_CHARSET,
+      OUT_DEFAULT_PRECIS,
+      CLIP_DEFAULT_PRECIS,
+      CLEARTYPE_QUALITY,
+      DEFAULT_PITCH | FF_DONTCARE,
+      family.c_str());
+  if (font != nullptr) {
+    impl.gdi_fonts.emplace(std::move(key), font);
+  }
+  return font;
+}
+
+Status ensure_text_bitmap_surface(Dx12Backend::Impl& impl, std::uint32_t width, std::uint32_t height) {
+  if (width == 0 || height == 0) {
+    reset_text_bitmap_state(impl);
+    return Status::success();
+  }
+  if (impl.text_bitmap_dc != nullptr && impl.text_bitmap_width == width && impl.text_bitmap_height == height && impl.text_bitmap_bits != nullptr) {
+    return Status::success();
+  }
+
+  reset_text_bitmap_state(impl);
+
+  impl.text_bitmap_dc = CreateCompatibleDC(nullptr);
+  if (impl.text_bitmap_dc == nullptr) {
+    return Status::backend_error("Dx12Backend failed to create the software text bitmap DC.");
+  }
+
+  BITMAPINFO bitmap_info{};
+  bitmap_info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bitmap_info.bmiHeader.biWidth = static_cast<LONG>(width);
+  bitmap_info.bmiHeader.biHeight = -static_cast<LONG>(height);
+  bitmap_info.bmiHeader.biPlanes = 1;
+  bitmap_info.bmiHeader.biBitCount = 32;
+  bitmap_info.bmiHeader.biCompression = BI_RGB;
+
+  impl.text_bitmap_handle = CreateDIBSection(impl.text_bitmap_dc, &bitmap_info, DIB_RGB_COLORS, &impl.text_bitmap_bits, nullptr, 0);
+  if (impl.text_bitmap_handle == nullptr || impl.text_bitmap_bits == nullptr) {
+    reset_text_bitmap_state(impl);
+    return Status::backend_error("Dx12Backend failed to create the software text bitmap surface.");
+  }
+
+  impl.text_bitmap_previous = static_cast<HBITMAP>(SelectObject(impl.text_bitmap_dc, impl.text_bitmap_handle));
+  impl.text_bitmap_width = width;
+  impl.text_bitmap_height = height;
+  SetBkMode(impl.text_bitmap_dc, TRANSPARENT);
+  SetTextColor(impl.text_bitmap_dc, RGB(255, 255, 255));
+  SetTextAlign(impl.text_bitmap_dc, TA_LEFT | TA_TOP);
+  return Status::success();
+}
+
+bool pack_text_labels(const std::vector<TextLabel>& labels,
+                      std::uint32_t max_dimension,
+                      std::uint32_t padding,
+                      std::vector<TextAtlasPlacement>& placements,
+                      std::uint32_t& atlas_width,
+                      std::uint32_t& atlas_height) {
+  placements.clear();
+  atlas_width = 0;
+  atlas_height = 0;
+  if (labels.empty()) {
+    return true;
+  }
+
+  const std::uint32_t clamped_padding = (std::max)(padding, 1u);
+  const std::uint32_t max_size = (std::max)(max_dimension, 64u);
+  std::uint32_t cursor_x = clamped_padding;
+  std::uint32_t cursor_y = clamped_padding;
+  std::uint32_t row_height = 0;
+  std::uint32_t used_width = 0;
+
+  placements.reserve(labels.size());
+  for (const auto& label : labels) {
+    const auto width = static_cast<std::uint32_t>((std::max)(1.0f, std::ceil(label.rect.right - label.rect.left)));
+    const auto height = static_cast<std::uint32_t>((std::max)(1.0f, std::ceil(label.rect.bottom - label.rect.top)));
+    if (width + clamped_padding * 2 > max_size || height + clamped_padding * 2 > max_size) {
+      return false;
+    }
+    if (cursor_x + width + clamped_padding > max_size) {
+      cursor_x = clamped_padding;
+      cursor_y += row_height + clamped_padding;
+      row_height = 0;
+    }
+    if (cursor_y + height + clamped_padding > max_size) {
+      return false;
+    }
+    placements.push_back({
+        .label = &label,
+        .atlas_x = cursor_x,
+        .atlas_y = cursor_y,
+        .width = width,
+        .height = height,
+    });
+    cursor_x += width + clamped_padding;
+    row_height = (std::max)(row_height, height);
+    used_width = (std::max)(used_width, cursor_x);
+  }
+
+  atlas_width = next_power_of_two((std::max)(used_width + clamped_padding, 64u));
+  atlas_height = next_power_of_two((std::max)(cursor_y + row_height + clamped_padding, 64u));
+  atlas_width = (std::min)(atlas_width, max_size);
+  atlas_height = (std::min)(atlas_height, max_size);
+  return true;
+}
+
+void normalize_text_bitmap_alpha(Dx12Backend::Impl& impl, std::uint32_t width, std::uint32_t height) {
+  auto* pixels = static_cast<std::uint8_t*>(impl.text_bitmap_bits);
+  if (pixels == nullptr) {
+    return;
+  }
+  const std::size_t pixel_count = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+  for (std::size_t index = 0; index < pixel_count; ++index) {
+    std::uint8_t* pixel = pixels + index * 4;
+    const std::uint8_t alpha = (std::max)((std::max)(pixel[0], pixel[1]), pixel[2]);
+    if (alpha == 0) {
+      pixel[0] = 0;
+      pixel[1] = 0;
+      pixel[2] = 0;
+      pixel[3] = 0;
+      continue;
+    }
+    pixel[0] = 0xFF;
+    pixel[1] = 0xFF;
+    pixel[2] = 0xFF;
+    pixel[3] = alpha;
+  }
+}
+
+Status ensure_text_atlas_texture(Dx12Backend::Impl& impl, std::uint32_t width, std::uint32_t height) {
+  if (impl.device == nullptr || width == 0 || height == 0) {
+    return Status::success();
+  }
+
+  if (!impl.text_atlas_heap) {
+    D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+    heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_desc.NumDescriptors = 1;
+    heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    const HRESULT heap_hr = impl.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&impl.text_atlas_heap));
+    if (FAILED(heap_hr)) {
+      return Status::backend_error("Dx12Backend failed to create the internal text atlas descriptor heap: " + hex_hr(heap_hr));
+    }
+    impl.text_atlas_cpu_descriptor = impl.text_atlas_heap->GetCPUDescriptorHandleForHeapStart();
+    impl.text_atlas_gpu_descriptor = impl.text_atlas_heap->GetGPUDescriptorHandleForHeapStart();
+  }
+
+  if (!impl.text_atlas_texture || impl.text_atlas_width != width || impl.text_atlas_height != height) {
+    impl.text_atlas_texture.Reset();
+    impl.text_atlas_upload.Reset();
+    impl.text_atlas_upload_size = 0;
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC resource_desc{};
+    resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    resource_desc.Width = width;
+    resource_desc.Height = height;
+    resource_desc.DepthOrArraySize = 1;
+    resource_desc.MipLevels = 1;
+    resource_desc.Format = kRenderTargetFormat;
+    resource_desc.SampleDesc.Count = 1;
+    resource_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    const HRESULT texture_hr = impl.device->CreateCommittedResource(
+        &heap_props,
+        D3D12_HEAP_FLAG_NONE,
+        &resource_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&impl.text_atlas_texture));
+    if (FAILED(texture_hr)) {
+      return Status::backend_error("Dx12Backend failed to create the internal text atlas texture: " + hex_hr(texture_hr));
+    }
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+    srv_desc.Format = kRenderTargetFormat;
+    srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv_desc.Texture2D.MipLevels = 1;
+    impl.device->CreateShaderResourceView(impl.text_atlas_texture.Get(), &srv_desc, impl.text_atlas_cpu_descriptor);
+
+    impl.text_atlas_width = width;
+    impl.text_atlas_height = height;
+    impl.text_atlas_state = D3D12_RESOURCE_STATE_COPY_DEST;
+  }
+
+  return Status::success();
+}
+
+Status ensure_text_atlas_upload_buffer(Dx12Backend::Impl& impl) {
+  if (impl.device == nullptr || !impl.text_atlas_texture) {
+    return Status::success();
+  }
+
+  const auto texture_desc = impl.text_atlas_texture->GetDesc();
+  UINT row_count = 0;
+  UINT64 row_size = 0;
+  std::uint64_t upload_size = 0;
+  impl.device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &impl.text_atlas_upload_footprint, &row_count, &row_size, &upload_size);
+  if (impl.text_atlas_upload && upload_size <= impl.text_atlas_upload_size) {
+    return Status::success();
+  }
+
+  reset_text_atlas_upload_buffer(impl);
+  impl.device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &impl.text_atlas_upload_footprint, &row_count, &row_size, &upload_size);
+
+  D3D12_HEAP_PROPERTIES heap_props{};
+  heap_props.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC buffer_desc{};
+  buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer_desc.Width = upload_size;
+  buffer_desc.Height = 1;
+  buffer_desc.DepthOrArraySize = 1;
+  buffer_desc.MipLevels = 1;
+  buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  buffer_desc.SampleDesc.Count = 1;
+
+  const HRESULT hr = impl.device->CreateCommittedResource(
+      &heap_props,
+      D3D12_HEAP_FLAG_NONE,
+      &buffer_desc,
+      D3D12_RESOURCE_STATE_GENERIC_READ,
+      nullptr,
+      IID_PPV_ARGS(&impl.text_atlas_upload));
+  if (FAILED(hr)) {
+    return Status::backend_error("Dx12Backend failed to create the text atlas upload buffer: " + hex_hr(hr));
+  }
+  void* mapped = nullptr;
+  const HRESULT map_hr = impl.text_atlas_upload->Map(0, nullptr, &mapped);
+  if (FAILED(map_hr)) {
+    impl.text_atlas_upload.Reset();
+    return Status::backend_error("Dx12Backend failed to map the text atlas upload buffer: " + hex_hr(map_hr));
+  }
+  impl.text_atlas_upload_mapped = static_cast<std::byte*>(mapped);
+  impl.text_atlas_upload_size = upload_size;
+  return Status::success();
+}
+
+Status upload_text_atlas(Dx12Backend::Impl& impl, ID3D12GraphicsCommandList* command_list) {
+  if (command_list == nullptr || impl.text_bitmap_bits == nullptr || impl.text_atlas_width == 0 || impl.text_atlas_height == 0) {
+    return Status::success();
+  }
+
+  Status status = ensure_text_atlas_texture(impl, impl.text_bitmap_width, impl.text_bitmap_height);
+  if (!status) {
+    return status;
+  }
+  status = ensure_text_atlas_upload_buffer(impl);
+  if (!status) {
+    return status;
+  }
+  if (!impl.text_atlas_texture || !impl.text_atlas_upload) {
+    return Status::success();
+  }
+  if (impl.text_atlas_upload_mapped == nullptr) {
+    return Status::not_ready("Dx12Backend text atlas upload buffer is not mapped.");
+  }
+
+  const auto* source = static_cast<const std::byte*>(impl.text_bitmap_bits);
+  const std::size_t source_row_pitch = static_cast<std::size_t>(impl.text_bitmap_width) * 4u;
+  for (UINT row = 0; row < impl.text_atlas_upload_footprint.Footprint.Height; ++row) {
+    std::memcpy(impl.text_atlas_upload_mapped + impl.text_atlas_upload_footprint.Offset +
+                    static_cast<std::size_t>(row) * impl.text_atlas_upload_footprint.Footprint.RowPitch,
+                source + static_cast<std::size_t>(row) * source_row_pitch,
+                source_row_pitch);
+  }
+
+  if (impl.text_atlas_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+    D3D12_RESOURCE_BARRIER to_copy{};
+    to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_copy.Transition.pResource = impl.text_atlas_texture.Get();
+    to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_copy.Transition.StateBefore = impl.text_atlas_state;
+    to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    command_list->ResourceBarrier(1, &to_copy);
+  }
+
+  D3D12_TEXTURE_COPY_LOCATION destination{};
+  destination.pResource = impl.text_atlas_texture.Get();
+  destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  destination.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION source_location{};
+  source_location.pResource = impl.text_atlas_upload.Get();
+  source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  source_location.PlacedFootprint = impl.text_atlas_upload_footprint;
+  command_list->CopyTextureRegion(&destination, 0, 0, 0, &source_location, nullptr);
+
+  D3D12_RESOURCE_BARRIER to_sample{};
+  to_sample.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  to_sample.Transition.pResource = impl.text_atlas_texture.Get();
+  to_sample.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  to_sample.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  to_sample.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  command_list->ResourceBarrier(1, &to_sample);
+  impl.text_atlas_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  return Status::success();
+}
+
+Status append_text_atlas_quads(Dx12Backend::Impl& impl, const Dx12BackendConfig& config, std::vector<Quad>& quads) {
+  if (impl.scratch_scene.labels.empty()) {
+    impl.text_atlas_width = 0;
+    impl.text_atlas_height = 0;
+    impl.scratch_text_placements.clear();
+    return Status::success();
+  }
+
+  const std::uint32_t max_dimension = static_cast<std::uint32_t>((std::max<std::size_t>)(
+      64u,
+      (std::min)(config.text_atlas.max_dimension, static_cast<std::uint32_t>(config.resource_budgets.max_text_atlas_dimension))));
+  const std::uint32_t padding = static_cast<std::uint32_t>((std::max<std::size_t>)(
+      1u,
+      (std::max)(config.text_atlas.padding, static_cast<std::uint32_t>(config.resource_budgets.text_atlas_padding))));
+
+  std::uint32_t atlas_width = 0;
+  std::uint32_t atlas_height = 0;
+  if (!pack_text_labels(impl.scratch_scene.labels, max_dimension, padding, impl.scratch_text_placements, atlas_width, atlas_height)) {
+    return Status::backend_error("Dx12Backend text atlas packing exceeded the configured atlas budget.");
+  }
+
+  Status status = ensure_text_bitmap_surface(impl, atlas_width, atlas_height);
+  if (!status) {
+    return status;
+  }
+  if (impl.text_bitmap_bits == nullptr || impl.text_bitmap_dc == nullptr) {
+    return Status::backend_error("Dx12Backend software text bitmap surface is unavailable.");
+  }
+
+  std::memset(impl.text_bitmap_bits, 0, estimate_bitmap_bytes(atlas_width, atlas_height));
+  SetBkMode(impl.text_bitmap_dc, TRANSPARENT);
+  SetTextColor(impl.text_bitmap_dc, RGB(255, 255, 255));
+
+  for (const auto& placement : impl.scratch_text_placements) {
+    const TextLabel& label = *placement.label;
+    HFONT font = resolve_gdi_font(impl, config, label);
+    HGDIOBJ previous_font = nullptr;
+    if (font != nullptr) {
+      previous_font = SelectObject(impl.text_bitmap_dc, font);
+    }
+
+    RECT draw_rect{
+        static_cast<LONG>(placement.atlas_x),
+        static_cast<LONG>(placement.atlas_y),
+        static_cast<LONG>(placement.atlas_x + placement.width),
+        static_cast<LONG>(placement.atlas_y + placement.height),
+    };
+    UINT draw_flags = DT_NOPREFIX | DT_SINGLELINE;
+    switch (label.style) {
+      case TextStyle::title:
+        draw_flags |= DT_LEFT | DT_VCENTER;
+        break;
+      case TextStyle::center:
+        draw_flags |= DT_CENTER | DT_VCENTER;
+        break;
+      case TextStyle::body:
+        draw_flags |= DT_LEFT | DT_TOP;
+        break;
+    }
+    DrawTextW(impl.text_bitmap_dc, label.text->c_str(), static_cast<int>(label.text->size()), &draw_rect, draw_flags);
+    if (previous_font != nullptr) {
+      SelectObject(impl.text_bitmap_dc, previous_font);
+    }
+  }
+
+  normalize_text_bitmap_alpha(impl, atlas_width, atlas_height);
+  impl.text_atlas_width = atlas_width;
+  impl.text_atlas_height = atlas_height;
+
+  quads.reserve(quads.size() + impl.scratch_text_placements.size());
+  for (const auto& placement : impl.scratch_text_placements) {
+    const TextLabel& label = *placement.label;
+    const float left = label.rect.left;
+    const float top = label.rect.top;
+    const float right = label.rect.right;
+    const float bottom = label.rect.bottom;
+    quads.push_back({
+        .points = {{
+            {left, top},
+            {left, bottom},
+            {right, top},
+            {right, bottom},
+        }},
+        .color = label.color,
+        .uv = {
+            static_cast<float>(placement.atlas_x) / static_cast<float>(atlas_width),
+            static_cast<float>(placement.atlas_y) / static_cast<float>(atlas_height),
+            static_cast<float>(placement.atlas_x + placement.width) / static_cast<float>(atlas_width),
+            static_cast<float>(placement.atlas_y + placement.height) / static_cast<float>(atlas_height),
+        },
+        .texture_key = kInternalTextAtlasKey,
+        .clip_rect = label.clip_rect,
+    });
+  }
+
+  return Status::success();
 }
 
 Status ensure_vertex_buffer(Dx12Backend::Impl& impl, std::size_t vertex_count) {
@@ -1240,6 +1980,10 @@ void clear_text_targets(Dx12Backend::Impl& impl) noexcept {
 
 Status Dx12Backend::create_text_interop() {
   reset_text_interop_state(*impl_);
+  if (config_.text_renderer != Dx12TextRendererMode::interop) {
+    impl_->text_interop_available = false;
+    return Status::success();
+  }
   if (!owns_device_objects_ || impl_->device == nullptr || impl_->queue == nullptr) {
     impl_->text_interop_available = false;
     return Status::success();
@@ -1360,6 +2104,9 @@ Status Dx12Backend::create_text_interop() {
 }
 
 Status Dx12Backend::realize_registered_fonts() {
+  if (config_.text_renderer == Dx12TextRendererMode::atlas) {
+    return Status::success();
+  }
   if (!impl_->dwrite_factory) {
     return Status::success();
   }
@@ -1390,6 +2137,49 @@ Status Dx12Backend::realize_registered_fonts() {
     impl_->font_formats[key] = std::move(format);
   }
   return Status::success();
+}
+
+Status Dx12Backend::upload_text_atlas(ID3D12GraphicsCommandList* command_list) {
+  if (!impl_) {
+    return Status::success();
+  }
+  return ::igr::backends::upload_text_atlas(*impl_, command_list);
+}
+
+Status Dx12Backend::ensure_text_bitmap_surface(std::uint32_t width, std::uint32_t height) {
+  return ::igr::backends::ensure_text_bitmap_surface(*impl_, width, height);
+}
+
+Status Dx12Backend::ensure_text_atlas_resources(std::uint32_t width, std::uint32_t height) {
+  Status status = ensure_text_atlas_texture(*impl_, width, height);
+  if (!status) {
+    return status;
+  }
+  return ensure_text_atlas_upload_buffer(*impl_);
+}
+
+bool Dx12Backend::should_use_text_atlas(const Dx12FrameBinding* active_binding) const noexcept {
+  if (config_.text_renderer != Dx12TextRendererMode::atlas) {
+    return false;
+  }
+  if (active_binding != nullptr && active_binding->host_sets_descriptor_heaps) {
+    return false;
+  }
+  return true;
+}
+
+Status Dx12Backend::populate_text_atlas(const Dx12FrameBinding* active_binding) {
+  if (!impl_ || impl_->device == nullptr || impl_->scratch_scene.labels.empty()) {
+    return Status::success();
+  }
+  if (!should_use_text_atlas(active_binding)) {
+    if (active_binding != nullptr && active_binding->host_sets_descriptor_heaps) {
+      return Status::invalid_argument(
+          "Dx12Backend atlas text rendering requires backend-managed descriptor heaps in host-managed mode.");
+    }
+    return Status::success();
+  }
+  return append_text_atlas_quads(*impl_, config_, impl_->scratch_scene.quads);
 }
 
 Status Dx12Backend::realize_registered_shaders() {
@@ -1669,13 +2459,15 @@ Status Dx12Backend::create_device_objects() {
   if (!shader_status) {
     return shader_status;
   }
-  return create_text_interop();
+  return Status::success();
 }
 
 void Dx12Backend::reset_device_objects(bool clear_textures) noexcept {
   clear_frame_binding();
   clear_owned_frame_state(*impl_);
   clear_text_targets(*impl_);
+  reset_text_bitmap_state(*impl_);
+  reset_text_atlas_state(*impl_);
   if (impl_->vertex_buffer && impl_->vertex_buffer_mapped != nullptr) {
     impl_->vertex_buffer->Unmap(0, nullptr);
     impl_->vertex_buffer_mapped = nullptr;
@@ -1736,6 +2528,7 @@ BackendCapabilities Dx12Backend::capabilities() const noexcept {
 }
 
 Status Dx12Backend::initialize() {
+  const auto initialize_started = std::chrono::steady_clock::now();
   if (initialized_) {
     return Status::success();
   }
@@ -1863,6 +2656,12 @@ Status Dx12Backend::initialize() {
   }
 
   initialized_ = true;
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "initialize",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - initialize_started).count()));
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -1879,6 +2678,7 @@ void Dx12Backend::invalidate_back_buffer_resources() noexcept {
 }
 
 Status Dx12Backend::resize(ExtentU viewport) {
+  const auto resize_started = std::chrono::steady_clock::now();
   if (!initialized_) {
     return Status::not_ready("Dx12Backend must be initialized before resize.");
   }
@@ -1896,6 +2696,12 @@ Status Dx12Backend::resize(ExtentU viewport) {
     if (viewport_.width == 0 || viewport_.height == 0) {
       clear_frame_binding();
     }
+    if (config_.diagnostics.enabled) {
+      record_scope(impl_->scope_totals,
+                   "resize",
+                   static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resize_started).count()));
+      refresh_telemetry();
+    }
     return Status::success();
   }
   if (impl_->device == nullptr || impl_->swap_chain == nullptr || impl_->rtv_heap == nullptr) {
@@ -1907,6 +2713,12 @@ Status Dx12Backend::resize(ExtentU viewport) {
       return idle_status;
     }
     invalidate_back_buffer_resources();
+    if (config_.diagnostics.enabled) {
+      record_scope(impl_->scope_totals,
+                   "resize",
+                   static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resize_started).count()));
+      refresh_telemetry();
+    }
     return Status::success();
   }
   Status status = wait_for_gpu_idle(*impl_);
@@ -1952,10 +2764,18 @@ Status Dx12Backend::resize(ExtentU viewport) {
     return Status::backend_error(device_error_message(impl_->device, "Dx12Backend failed to recreate the graphics command list after resize", command_list_hr));
   }
   impl_->owned_command_list->Close();
-  return impl_->text_interop_available ? rebuild_text_targets() : Status::success();
+  Status final_status = impl_->text_interop_available ? rebuild_text_targets() : Status::success();
+  if (final_status && config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "resize",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resize_started).count()));
+    refresh_telemetry();
+  }
+  return final_status;
 }
 
 Status Dx12Backend::render(const FrameDocument& document) {
+  const auto render_started = std::chrono::steady_clock::now();
   if (!initialized_) {
     return Status::not_ready("Dx12Backend must be initialized before render.");
   }
@@ -1983,17 +2803,43 @@ Status Dx12Backend::render(const FrameDocument& document) {
   if (!texture_status) {
     return texture_status;
   }
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "validate_document",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - render_started).count()));
+  }
   const auto build_started = std::chrono::steady_clock::now();
   build_scene(document, config_.theme, impl_->image_resources, impl_->font_descriptors, impl_->wide_text_cache, impl_->scratch_scene);
-  build_batches(impl_->scratch_scene.quads, viewport_, impl_->scratch_vertices, impl_->scratch_batches);
-  if (impl_->scratch_scene.labels.empty()) {
-    if (impl_->text_interop_available && ++impl_->textless_frame_streak >= 120u) {
-      reset_text_interop_state(*impl_);
+  const bool atlas_supported_for_frame = config_.text_renderer == Dx12TextRendererMode::atlas &&
+                                         (active_binding == nullptr || !active_binding->host_sets_descriptor_heaps);
+  bool use_text_atlas = false;
+  if (!impl_->scratch_scene.labels.empty() && atlas_supported_for_frame) {
+    const Status atlas_status = populate_text_atlas(active_binding);
+    if (atlas_status) {
+      use_text_atlas = true;
+      impl_->textless_frame_streak = 0;
+      if (impl_->text_interop_available) {
+        reset_text_interop_state(*impl_);
+      }
+    } else if (owns_device_objects_) {
+      reset_text_atlas_state(*impl_);
+      use_text_atlas = false;
+    } else {
+      return atlas_status;
+    }
+  } else if (impl_->scratch_scene.labels.empty()) {
+    if (++impl_->textless_frame_streak >= config_.text_interop_idle_frame_threshold) {
+      if (impl_->text_interop_available) {
+        reset_text_interop_state(*impl_);
+      }
+      reset_text_atlas_state(*impl_);
+      reset_text_bitmap_state(*impl_);
       impl_->textless_frame_streak = 0;
     }
   } else {
     impl_->textless_frame_streak = 0;
   }
+  build_batches(impl_->scratch_scene.quads, viewport_, impl_->scratch_vertices, impl_->scratch_batches);
   for (const auto& root : document.roots) {
     accumulate_widget_stats(root, impl_->stats);
   }
@@ -2011,6 +2857,9 @@ Status Dx12Backend::render(const FrameDocument& document) {
   impl_->stats.vertex_count = impl_->scratch_vertices.size();
   impl_->stats.scene_build_microseconds =
       static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - build_started).count());
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals, "scene_build", impl_->stats.scene_build_microseconds);
+  }
   Status status = ensure_vertex_buffer(*impl_, impl_->scratch_vertices.size());
   if (!status) {
     return status;
@@ -2019,11 +2868,17 @@ Status Dx12Backend::render(const FrameDocument& document) {
   if (!status) {
     return status;
   }
+  const auto upload_started = std::chrono::steady_clock::now();
   if (!impl_->scratch_vertices.empty()) {
     std::memcpy(impl_->vertex_buffer_mapped, impl_->scratch_vertices.data(), impl_->scratch_vertices.size() * sizeof(QuadVertex));
   }
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "vertex_upload",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - upload_started).count()));
+  }
 
-  const auto render_started = std::chrono::steady_clock::now();
+  const auto submit_started = std::chrono::steady_clock::now();
   const auto render_text_for_owned_frame = [&](std::uint32_t owned_frame_index) -> Status {
     if (!impl_->text_interop_available || impl_->scratch_scene.labels.empty()) {
       return Status::success();
@@ -2035,6 +2890,7 @@ Status Dx12Backend::render(const FrameDocument& document) {
     if (!text_frame.wrapped_back_buffer || !text_frame.text_bitmap || !impl_->on12_device || !impl_->d2d_context || !impl_->d2d_brush) {
       return Status::success();
     }
+    const auto text_pass_started = std::chrono::steady_clock::now();
 
     ID3D11Resource* wrapped_resources[] = {text_frame.wrapped_back_buffer.Get()};
     impl_->on12_device->AcquireWrappedResources(wrapped_resources, 1);
@@ -2074,6 +2930,11 @@ Status Dx12Backend::render(const FrameDocument& document) {
     }
     if (FAILED(draw_hr)) {
       return Status::backend_error("Dx12Backend DirectWrite text pass failed: " + hex_hr(draw_hr));
+    }
+    if (config_.diagnostics.enabled) {
+      record_scope(impl_->scope_totals,
+                   "text_pass",
+                   static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - text_pass_started).count()));
     }
     return Status::success();
   };
@@ -2193,14 +3054,35 @@ Status Dx12Backend::render(const FrameDocument& document) {
     return Status::success();
   };
 
+  const bool wants_interop_text = !use_text_atlas && config_.text_renderer == Dx12TextRendererMode::interop;
+
   if (!owns_device_objects_) {
+    if (use_text_atlas) {
+      status = upload_text_atlas(frame_binding_.command_list);
+      if (!status) {
+        return status;
+      }
+      impl_->textures[std::string(kInternalTextAtlasKey)] = {
+          .heap = impl_->text_atlas_heap.Get(),
+          .cpu_descriptor = impl_->text_atlas_heap->GetCPUDescriptorHandleForHeapStart(),
+          .gpu_descriptor = impl_->text_atlas_heap->GetGPUDescriptorHandleForHeapStart(),
+      };
+    } else {
+      impl_->textures.erase(std::string(kInternalTextAtlasKey));
+    }
     status = record_batches(frame_binding_.command_list, frame_binding_);
     if (!status) {
       return status;
     }
     impl_->stats.render_submit_microseconds =
-        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - render_started).count());
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submit_started).count());
+    if (config_.diagnostics.enabled) {
+      record_scope(impl_->scope_totals, "render_submit", impl_->stats.render_submit_microseconds);
+    }
     last_widget_count_ = document.widget_count();
+    trim_wide_text_cache(impl_->wide_text_cache, config_.resource_budgets);
+    trim_scratch_storage(impl_->scratch_scene, impl_->scratch_vertices, impl_->scratch_batches, config_.resource_budgets);
+    refresh_telemetry();
     return Status::success();
   }
 
@@ -2213,11 +3095,13 @@ Status Dx12Backend::render(const FrameDocument& document) {
   if (frame.back_buffer == nullptr || frame.rtv.ptr == 0 || impl_->owned_command_list == nullptr) {
     return Status::not_ready("Dx12Backend cannot render an owned frame before back-buffer resources are ready.");
   }
-  if (!impl_->scratch_scene.labels.empty() && (!impl_->text_interop_available || !frame.text_bitmap || !frame.wrapped_back_buffer)) {
+  if (wants_interop_text && !impl_->scratch_scene.labels.empty() && (!impl_->text_interop_available || !frame.text_bitmap || !frame.wrapped_back_buffer)) {
     status = rebuild_text_targets();
     if (!status) {
       return status;
     }
+  } else if (!wants_interop_text && impl_->text_interop_available) {
+    reset_text_interop_state(*impl_);
   }
   status = wait_for_fence(*impl_, frame.fence_value);
   if (!status) {
@@ -2225,11 +3109,13 @@ Status Dx12Backend::render(const FrameDocument& document) {
   }
   HRESULT hr = frame.allocator->Reset();
   if (FAILED(hr)) {
-    return Status::backend_error("Dx12Backend failed to reset the command allocator: " + hex_hr(hr));
+    return Status::backend_error("Dx12Backend failed to reset the command allocator: " + hex_hr(hr) +
+                                 recent_debug_messages(impl_->device));
   }
   hr = impl_->owned_command_list->Reset(frame.allocator.Get(), impl_->solid_pso.Get());
   if (FAILED(hr)) {
-    return Status::backend_error("Dx12Backend failed to reset the command list: " + hex_hr(hr));
+    return Status::backend_error("Dx12Backend failed to reset the command list: " + hex_hr(hr) +
+                                 recent_debug_messages(impl_->device));
   }
 
   Dx12FrameBinding owned_binding{};
@@ -2243,9 +3129,23 @@ Status Dx12Backend::render(const FrameDocument& document) {
   owned_binding.host_transitions_render_target = false;
   owned_binding.render_target_state_before = D3D12_RESOURCE_STATE_PRESENT;
   const bool use_text_interop =
-      impl_->text_interop_available && !impl_->scratch_scene.labels.empty() && frame.text_bitmap && frame.wrapped_back_buffer;
+      wants_interop_text && impl_->text_interop_available && !impl_->scratch_scene.labels.empty() && frame.text_bitmap && frame.wrapped_back_buffer;
   owned_binding.render_target_state_after = use_text_interop ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_PRESENT;
   owned_binding.clear_target = true;
+
+  if (use_text_atlas) {
+    status = upload_text_atlas(impl_->owned_command_list.Get());
+    if (!status) {
+      return status;
+    }
+    impl_->textures[std::string(kInternalTextAtlasKey)] = {
+        .heap = impl_->text_atlas_heap.Get(),
+        .cpu_descriptor = impl_->text_atlas_heap->GetCPUDescriptorHandleForHeapStart(),
+        .gpu_descriptor = impl_->text_atlas_heap->GetGPUDescriptorHandleForHeapStart(),
+    };
+  } else {
+    impl_->textures.erase(std::string(kInternalTextAtlasKey));
+  }
 
   status = record_batches(impl_->owned_command_list.Get(), owned_binding);
   if (!status) {
@@ -2254,7 +3154,8 @@ Status Dx12Backend::render(const FrameDocument& document) {
 
   hr = impl_->owned_command_list->Close();
   if (FAILED(hr)) {
-    return Status::backend_error("Dx12Backend failed to close the command list: " + hex_hr(hr));
+    return Status::backend_error("Dx12Backend failed to close the command list: " + hex_hr(hr) +
+                                 recent_debug_messages(impl_->device));
   }
 
   impl_->owned_command_list_executed = false;
@@ -2272,11 +3173,18 @@ Status Dx12Backend::render(const FrameDocument& document) {
   impl_->owned_frame_pending = true;
   last_widget_count_ = document.widget_count();
   impl_->stats.render_submit_microseconds =
-      static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - render_started).count());
+      static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submit_started).count());
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals, "render_submit", impl_->stats.render_submit_microseconds);
+  }
+  trim_wide_text_cache(impl_->wide_text_cache, config_.resource_budgets);
+  trim_scratch_storage(impl_->scratch_scene, impl_->scratch_vertices, impl_->scratch_batches, config_.resource_budgets);
+  refresh_telemetry();
   return Status::success();
 }
 
 Status Dx12Backend::present() {
+  const auto present_started = std::chrono::steady_clock::now();
   if (!initialized_) {
     return Status::not_ready("Dx12Backend must be initialized before present.");
   }
@@ -2315,6 +3223,12 @@ Status Dx12Backend::present() {
     return Status::backend_error(device_error_message(impl_->device, "Dx12Backend failed to present the swap chain", hr));
   }
   clear_owned_frame_submission_state();
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "present",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - present_started).count()));
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -2322,7 +3236,84 @@ BackendFrameStats Dx12Backend::frame_stats() const noexcept {
   return impl_ ? impl_->stats : BackendFrameStats{};
 }
 
+BackendTelemetrySnapshot Dx12Backend::telemetry() const noexcept {
+  return impl_ ? impl_->telemetry : BackendTelemetrySnapshot{};
+}
+
+void Dx12Backend::refresh_telemetry() noexcept {
+  if (!impl_) {
+    return;
+  }
+
+  impl_->telemetry.frame = impl_->stats;
+  if (!config_.diagnostics.enabled) {
+    impl_->telemetry_refresh_count = 0;
+    impl_->telemetry.process_memory = {};
+    impl_->telemetry.gpu_memory = {};
+    impl_->telemetry.resources = {};
+    impl_->telemetry.scopes.clear();
+    return;
+  }
+
+  ++impl_->telemetry_refresh_count;
+  const std::uint32_t memory_interval = (std::max)(1u, config_.diagnostics.memory_sample_interval);
+  const bool sample_memory = impl_->telemetry_refresh_count == 1 || (impl_->telemetry_refresh_count % memory_interval) == 0;
+
+  if (config_.diagnostics.collect_process_memory && sample_memory) {
+    impl_->telemetry.process_memory = query_process_memory();
+  }
+  if (config_.diagnostics.collect_gpu_memory && sample_memory) {
+    ComPtr<IDXGIFactory4> diagnostics_factory;
+    ComPtr<IDXGIAdapter> diagnostics_adapter;
+    impl_->telemetry.gpu_memory = query_gpu_memory(resolve_dxgi_adapter(impl_->device, impl_->factory.Get(), diagnostics_factory, diagnostics_adapter));
+  }
+  if (config_.diagnostics.collect_resource_usage) {
+    ResourceUsageSnapshot resources{};
+    resources.font_count = impl_->font_descriptors.size();
+    resources.image_count = impl_->image_resources.size();
+    resources.shader_count = impl_->shader_descriptors.size();
+    resources.texture_count = impl_->textures.size();
+    resources.font_cache_bytes = estimate_font_format_bytes(impl_->font_formats);
+    resources.wide_text_cache_bytes = estimate_wide_text_cache_bytes(impl_->wide_text_cache);
+    resources.scene_bytes = estimate_scene_bytes(impl_->scratch_scene);
+    resources.scratch_vertex_bytes = static_cast<std::uint64_t>(impl_->scratch_vertices.capacity()) * sizeof(QuadVertex);
+    resources.scratch_batch_bytes = static_cast<std::uint64_t>(impl_->scratch_batches.capacity()) * sizeof(DrawBatch);
+    resources.gpu_vertex_buffer_bytes = estimate_d3d12_resource_bytes(impl_->vertex_buffer.Get());
+    resources.gpu_constant_buffer_bytes = estimate_d3d12_resource_bytes(impl_->shader_constant_buffer.Get());
+    resources.gpu_text_atlas_bytes = estimate_d3d12_resource_bytes(impl_->text_atlas_texture.Get());
+    resources.cpu_text_bitmap_bytes = estimate_bitmap_bytes(impl_->text_bitmap_width, impl_->text_bitmap_height);
+    resources.text_interop_active = impl_->text_interop_available;
+    resources.text_atlas_active = impl_->text_atlas_texture != nullptr;
+    resources.total_estimated_bytes = resources.font_cache_bytes + resources.wide_text_cache_bytes + resources.scene_bytes +
+                                      resources.scratch_vertex_bytes + resources.scratch_batch_bytes + resources.gpu_vertex_buffer_bytes +
+                                      resources.gpu_constant_buffer_bytes + resources.gpu_text_atlas_bytes + resources.cpu_text_bitmap_bytes;
+    impl_->telemetry.resources = resources;
+  }
+  if (config_.diagnostics.collect_scope_timings) {
+    impl_->telemetry.scopes.clear();
+    impl_->telemetry.scopes.reserve(impl_->scope_totals.size());
+    for (const auto& [name, totals] : impl_->scope_totals) {
+      impl_->telemetry.scopes.push_back({
+          .name = name,
+          .call_count = totals.call_count,
+          .total_microseconds = totals.total_microseconds,
+          .max_microseconds = totals.max_microseconds,
+      });
+    }
+    std::sort(impl_->telemetry.scopes.begin(), impl_->telemetry.scopes.end(), [](const ScopeTelemetry& lhs, const ScopeTelemetry& rhs) {
+      if (lhs.total_microseconds == rhs.total_microseconds) {
+        return lhs.name < rhs.name;
+      }
+      return lhs.total_microseconds > rhs.total_microseconds;
+    });
+    if (impl_->telemetry.scopes.size() > config_.diagnostics.top_scope_limit) {
+      impl_->telemetry.scopes.resize(config_.diagnostics.top_scope_limit);
+    }
+  }
+}
+
 Status Dx12Backend::register_font(std::string_view key, const FontResourceDesc& descriptor) {
+  const auto started = std::chrono::steady_clock::now();
   if (key.empty()) {
     return Status::invalid_argument("Dx12Backend font registration requires a non-empty key.");
   }
@@ -2332,7 +3323,14 @@ Status Dx12Backend::register_font(std::string_view key, const FontResourceDesc& 
   }
   impl_->font_descriptors[std::string(key)] = descriptor;
   impl_->font_formats.erase(std::string(key));
-  return realize_registered_fonts();
+  Status status = realize_registered_fonts();
+  if (status && config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "register_font",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+    refresh_telemetry();
+  }
+  return status;
 }
 
 void Dx12Backend::unregister_font(std::string_view key) noexcept {
@@ -2341,9 +3339,11 @@ void Dx12Backend::unregister_font(std::string_view key) noexcept {
   }
   impl_->font_descriptors.erase(std::string(key));
   impl_->font_formats.erase(std::string(key));
+  refresh_telemetry();
 }
 
 Status Dx12Backend::register_image(std::string_view key, const ImageResourceDesc& descriptor) {
+  const auto started = std::chrono::steady_clock::now();
   if (key.empty()) {
     return Status::invalid_argument("Dx12Backend image registration requires a non-empty key.");
   }
@@ -2352,6 +3352,12 @@ Status Dx12Backend::register_image(std::string_view key, const ImageResourceDesc
     return validation_status;
   }
   impl_->image_resources[std::string(key)] = descriptor;
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "register_image",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -2360,9 +3366,11 @@ void Dx12Backend::unregister_image(std::string_view key) noexcept {
     return;
   }
   impl_->image_resources.erase(std::string(key));
+  refresh_telemetry();
 }
 
 Status Dx12Backend::register_shader(std::string_view key, const ShaderResourceDesc& descriptor) {
+  const auto started = std::chrono::steady_clock::now();
   if (key.empty()) {
     return Status::invalid_argument("Dx12Backend shader registration requires a non-empty key.");
   }
@@ -2371,7 +3379,14 @@ Status Dx12Backend::register_shader(std::string_view key, const ShaderResourceDe
   }
   impl_->shader_descriptors[std::string(key)] = descriptor;
   impl_->shaders.erase(std::string(key));
-  return realize_registered_shaders();
+  Status status = realize_registered_shaders();
+  if (status && config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "register_shader",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+    refresh_telemetry();
+  }
+  return status;
 }
 
 void Dx12Backend::unregister_shader(std::string_view key) noexcept {
@@ -2380,6 +3395,7 @@ void Dx12Backend::unregister_shader(std::string_view key) noexcept {
   }
   impl_->shader_descriptors.erase(std::string(key));
   impl_->shaders.erase(std::string(key));
+  refresh_telemetry();
 }
 
 void Dx12Backend::shutdown() noexcept {
@@ -2395,6 +3411,7 @@ void Dx12Backend::shutdown() noexcept {
     detail::release_storage(impl_->image_resources);
     detail::release_storage(impl_->shader_descriptors);
     detail::release_storage(impl_->font_formats);
+    detail::release_storage(impl_->wide_text_cache);
     detail::release_storage(impl_->shaders);
     invalidate_back_buffer_resources();
     impl_->owned_command_list.Reset();
@@ -2413,6 +3430,8 @@ void Dx12Backend::shutdown() noexcept {
     impl_->factory.Reset();
     impl_->owned_frame_pending = false;
     impl_->stats = {};
+    impl_->telemetry = {};
+    impl_->telemetry_refresh_count = 0;
     release_transient_storage();
   }
   viewport_ = {};
@@ -2451,6 +3470,9 @@ Status Dx12Backend::register_texture(std::string_view key, const Dx12TextureBind
     return validation_status;
   }
   impl_->textures[std::string(key)] = binding;
+  if (config_.diagnostics.enabled) {
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -2459,6 +3481,7 @@ void Dx12Backend::unregister_texture(std::string_view key) noexcept {
     return;
   }
   impl_->textures.erase(std::string(key));
+  refresh_telemetry();
 }
 
 void Dx12Backend::clear_frame_binding() noexcept {
@@ -2565,13 +3588,18 @@ void Dx12Backend::release_transient_storage() noexcept {
   }
   impl_->scratch_scene.quads.clear();
   impl_->scratch_scene.labels.clear();
+  impl_->scratch_scene.wide_text_cache = nullptr;
+  impl_->scratch_text_placements.clear();
   detail::release_storage(impl_->scratch_scene.quads);
   detail::release_storage(impl_->scratch_scene.labels);
+  detail::release_storage(impl_->scratch_text_placements);
   detail::release_storage(impl_->scratch_vertices);
   detail::release_storage(impl_->scratch_batches);
+  detail::release_storage(impl_->wide_text_cache);
 }
 
 }  // namespace igr::backends
+
 
 
 

@@ -43,6 +43,16 @@ struct Dx12TextureBinding {
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_descriptor{};
 };
 
+enum class Dx12TextRendererMode {
+  atlas,
+  interop,
+};
+
+struct Dx12TextAtlasConfig {
+  std::uint32_t max_dimension{2048};
+  std::uint32_t padding{1};
+};
+
 struct Dx12HostBinding {
   HWND window_handle{};
   ExtentU viewport{};
@@ -69,6 +79,8 @@ struct Dx12FrameBinding {
 
 struct Dx12BackendConfig {
   BackendHostOptions host{};
+  DiagnosticsConfig diagnostics{};
+  ResourceBudgetConfig resource_budgets{};
   HWND window_handle{};
   ExtentU initial_viewport{1280, 720};
   ID3D12Device* device{};
@@ -77,11 +89,14 @@ struct Dx12BackendConfig {
   IDXGISwapChain3* swap_chain{};
   bool enable_debug_layer{false};
   bool enable_vsync{true};
+  Dx12TextRendererMode text_renderer{Dx12TextRendererMode::interop};
+  Dx12TextAtlasConfig text_atlas{};
+  std::uint32_t text_interop_idle_frame_threshold{120};
   std::array<float, 4> clear_color{0.05f, 0.06f, 0.08f, 1.0f};
   Dx12Theme theme{};
 };
 
-class Dx12Backend final : public IRendererBackend {
+class Dx12Backend final : public IRendererBackend, public IResourceRegistry {
  public:
   class Impl;
 
@@ -92,18 +107,19 @@ class Dx12Backend final : public IRendererBackend {
   [[nodiscard]] std::string_view name() const noexcept override;
   [[nodiscard]] BackendCapabilities capabilities() const noexcept override;
   [[nodiscard]] BackendFrameStats frame_stats() const noexcept override;
+  [[nodiscard]] BackendTelemetrySnapshot telemetry() const noexcept override;
 
   Status initialize() override;
   void invalidate_back_buffer_resources() noexcept override;
   Status resize(ExtentU viewport) override;
   Status render(const FrameDocument& document) override;
   Status present() override;
-  Status register_font(std::string_view key, const FontResourceDesc& descriptor);
-  void unregister_font(std::string_view key) noexcept;
-  Status register_image(std::string_view key, const ImageResourceDesc& descriptor);
-  void unregister_image(std::string_view key) noexcept;
-  Status register_shader(std::string_view key, const ShaderResourceDesc& descriptor);
-  void unregister_shader(std::string_view key) noexcept;
+  Status register_font(std::string_view key, const FontResourceDesc& descriptor) override;
+  void unregister_font(std::string_view key) noexcept override;
+  Status register_image(std::string_view key, const ImageResourceDesc& descriptor) override;
+  void unregister_image(std::string_view key) noexcept override;
+  Status register_shader(std::string_view key, const ShaderResourceDesc& descriptor) override;
+  void unregister_shader(std::string_view key) noexcept override;
   void shutdown() noexcept override;
   Status bind_frame(const Dx12FrameBinding& binding);
   Status register_texture(std::string_view key, const Dx12TextureBinding& binding);
@@ -129,9 +145,15 @@ class Dx12Backend final : public IRendererBackend {
  private:
   Status create_device_objects();
   Status create_text_interop();
+  Status ensure_text_bitmap_surface(std::uint32_t width, std::uint32_t height);
+  Status ensure_text_atlas_resources(std::uint32_t width, std::uint32_t height);
+  Status populate_text_atlas(const Dx12FrameBinding* active_binding);
   Status realize_registered_fonts();
   Status realize_registered_shaders();
   Status rebuild_text_targets();
+  Status upload_text_atlas(ID3D12GraphicsCommandList* command_list);
+  bool should_use_text_atlas(const Dx12FrameBinding* active_binding) const noexcept;
+  void refresh_telemetry() noexcept;
   void clear_owned_frame_submission_state() noexcept;
   void release_transient_storage() noexcept;
   void reset_device_objects(bool clear_textures) noexcept;

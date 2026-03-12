@@ -3,7 +3,8 @@ cmake_minimum_required(VERSION 3.28)
 project(igr_ui VERSION 0.1.0 LANGUAGES CXX)
 
 include(FetchContent)
-file(TO_CMAKE_PATH "$ENV{LOCALAPPDATA}/igr-fetchcontent" FETCHCONTENT_BASE_DIR)
+set(IGR_FETCHCONTENT_BASE_DIR "${PROJECT_SOURCE_DIR}/.cache/fetchcontent" CACHE PATH "Base directory for fetched third-party dependencies")
+set(FETCHCONTENT_BASE_DIR "${IGR_FETCHCONTENT_BASE_DIR}")
 
 option(IGR_BUILD_TESTS "Build native tests" ON)
 option(IGR_BUILD_EXAMPLES "Build native examples" ON)
@@ -123,6 +124,7 @@ endif()
 
 add_library(igr_core STATIC
   src/context.cpp
+  src/diagnostics.cpp
   src/frame.cpp
   src/interaction.cpp
   src/resources.cpp
@@ -130,6 +132,7 @@ add_library(igr_core STATIC
 )
 add_library(igr::core ALIAS igr_core)
 igr_configure_target(igr_core)
+target_link_libraries(igr_core PUBLIC Psapi)
 
 add_library(igr_shader_compiler STATIC
   src/shader_compiler.cpp

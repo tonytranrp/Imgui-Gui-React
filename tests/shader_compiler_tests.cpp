@@ -12,6 +12,7 @@ int fail(const char* message) {
 }  // namespace
 
 int main() {
+  #if IGR_ENABLE_GLSL_SHADERS
   {
     igr::ShaderResourceDesc shader{};
     shader.pixel.language = igr::ShaderLanguage::hlsl;
@@ -64,6 +65,20 @@ void main() {
       return fail("GLSL shader compilation produced an unexpected program layout");
     }
   }
+#else
+  {
+    igr::ShaderResourceDesc shader{};
+    shader.pixel.language = igr::ShaderLanguage::glsl;
+    shader.pixel.entry_point = "main";
+    shader.pixel.source = "void main() {}";
+
+    igr::shaders::CompiledProgram program;
+    igr::Status status = igr::shaders::compile_program(shader, {.debug_info = false}, &program);
+    if (status) {
+      return fail("GLSL shader compilation should fail when GLSL support is disabled");
+    }
+  }
+#endif
 
   std::cout << "igr_shader_compiler_tests passed" << '\n';
   return 0;

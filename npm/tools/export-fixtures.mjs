@@ -13,7 +13,10 @@ if (typeof fixtureModule.exportPhysicsFixture !== "function") {
   process.exit(1);
 }
 
-const outputPath = path.resolve(workspaceRoot, "../tests/fixtures/react-native-test.physics.json");
+const outputPathArg = process.argv[2];
+const outputPath = outputPathArg
+  ? path.resolve(workspaceRoot, outputPathArg)
+  : path.resolve(workspaceRoot, "apps/react-native-test/dist/react-native-test.physics.json");
 await mkdir(path.dirname(outputPath), { recursive: true });
 await fixtureModule.exportPhysicsFixture(outputPath);
 

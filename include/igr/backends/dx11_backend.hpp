@@ -50,6 +50,8 @@ struct Dx11Theme {
 
 struct Dx11BackendConfig {
   BackendHostOptions host{};
+  DiagnosticsConfig diagnostics{};
+  ResourceBudgetConfig resource_budgets{};
   HWND window_handle{};
   ExtentU initial_viewport{1280, 720};
   ID3D11Device* device{};
@@ -63,7 +65,7 @@ struct Dx11BackendConfig {
   Dx11Theme theme{};
 };
 
-class Dx11Backend final : public IRendererBackend {
+class Dx11Backend final : public IRendererBackend, public IResourceRegistry {
  public:
   explicit Dx11Backend(Dx11BackendConfig config = {});
   ~Dx11Backend() override;
@@ -72,19 +74,20 @@ class Dx11Backend final : public IRendererBackend {
   [[nodiscard]] std::string_view name() const noexcept override;
   [[nodiscard]] BackendCapabilities capabilities() const noexcept override;
   [[nodiscard]] BackendFrameStats frame_stats() const noexcept override;
+  [[nodiscard]] BackendTelemetrySnapshot telemetry() const noexcept override;
 
   Status initialize() override;
   void invalidate_back_buffer_resources() noexcept override;
   Status resize(ExtentU viewport) override;
   Status render(const FrameDocument& document) override;
   Status present() override;
-  Status register_font(std::string_view key, const FontResourceDesc& descriptor);
-  void unregister_font(std::string_view key) noexcept;
+  Status register_font(std::string_view key, const FontResourceDesc& descriptor) override;
+  void unregister_font(std::string_view key) noexcept override;
   void shutdown() noexcept override;
-  Status register_image(std::string_view key, const ImageResourceDesc& descriptor);
-  void unregister_image(std::string_view key) noexcept;
-  Status register_shader(std::string_view key, const ShaderResourceDesc& descriptor);
-  void unregister_shader(std::string_view key) noexcept;
+  Status register_image(std::string_view key, const ImageResourceDesc& descriptor) override;
+  void unregister_image(std::string_view key) noexcept override;
+  Status register_shader(std::string_view key, const ShaderResourceDesc& descriptor) override;
+  void unregister_shader(std::string_view key) noexcept override;
   Status register_texture(std::string_view key, const Dx11TextureBinding& binding);
   Status register_texture(std::string_view key, ID3D11ShaderResourceView* shader_resource_view);
   void unregister_texture(std::string_view key) noexcept;
@@ -110,6 +113,7 @@ class Dx11Backend final : public IRendererBackend {
   Status create_pipeline();
   Status realize_registered_fonts();
   Status realize_registered_shaders();
+  void refresh_telemetry() noexcept;
   void prepare_for_resize() noexcept;
   void release_transient_storage() noexcept;
   void reset_device_objects(bool clear_textures) noexcept;

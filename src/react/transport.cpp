@@ -1615,4 +1615,69 @@ Status materialize_transport_envelope(std::string_view payload, FrameBuilder& bu
   return materialize_transport_envelope(envelope, builder);
 }
 
+Status apply_transport_resources(const TransportEnvelope& envelope, IResourceRegistry& registry) {
+  if (envelope.kind != "igr.document.v1") {
+    return Status::invalid_argument("Unsupported transport kind: " + envelope.kind);
+  }
+
+  for (const auto& font : envelope.fonts) {
+    Status status = registry.register_font(font.key, font.descriptor);
+    if (!status) {
+      return status;
+    }
+  }
+  for (const auto& image : envelope.images) {
+    Status status = registry.register_image(image.key, image.descriptor);
+    if (!status) {
+      return status;
+    }
+  }
+  for (const auto& shader : envelope.shaders) {
+    Status status = registry.register_shader(shader.key, shader.descriptor);
+    if (!status) {
+      return status;
+    }
+  }
+  return Status::success();
+}
+
+Status reconcile_transport_resources(const TransportEnvelope& previous, const TransportEnvelope& current, IResourceRegistry& registry) {
+  if (current.kind != "igr.document.v1") {
+    return Status::invalid_argument("Unsupported transport kind: " + current.kind);
+  }
+
+  Status status = apply_transport_resources(current, registry);
+  if (!status) {
+    return status;
+  }
+
+  auto has_font = [&](std::string_view key) {
+    return std::find_if(current.fonts.begin(), current.fonts.end(), [&](const TransportFontResource& font) { return font.key == key; }) != current.fonts.end();
+  };
+  auto has_image = [&](std::string_view key) {
+    return std::find_if(current.images.begin(), current.images.end(), [&](const TransportImageResource& image) { return image.key == key; }) != current.images.end();
+  };
+  auto has_shader = [&](std::string_view key) {
+    return std::find_if(current.shaders.begin(), current.shaders.end(), [&](const TransportShaderResource& shader) { return shader.key == key; }) != current.shaders.end();
+  };
+
+  for (const auto& font : previous.fonts) {
+    if (!has_font(font.key)) {
+      registry.unregister_font(font.key);
+    }
+  }
+  for (const auto& image : previous.images) {
+    if (!has_image(image.key)) {
+      registry.unregister_image(image.key);
+    }
+  }
+  for (const auto& shader : previous.shaders) {
+    if (!has_shader(shader.key)) {
+      registry.unregister_shader(shader.key);
+    }
+  }
+
+  return Status::success();
+}
+
 }  // namespace igr::react

@@ -66,6 +66,18 @@
   - stopped DX12 text-target rebuilds from recreating the entire interop stack on every resize when the existing interop device can be reused
   - tightened resource validation so invalid font sizes, invalid image descriptors, foreign-device DX11 textures, wrong DX12 heap types, missing CPU descriptors, and non-shader-visible heaps fail early
   - extended backend regression coverage for the stricter DX11 and DX12 resource-registration rules
+- Diagnostics and DX12 text-atlas pass:
+  - added shared backend telemetry snapshots for process memory, GPU memory, resource estimates, and top runtime scopes
+  - moved React/Hermes transport resource application into the runtime bridge so native render paths no longer need backend-specific test glue
+  - added a software text-atlas path for DX12 while keeping conservative D3D11On12 plus DirectWrite interop as the backend default text renderer
+  - updated the DX12 sample to opt into atlas mode by default and added a `--text-interop` switch for live fallback validation
+  - cut the DX12 sample private bytes from roughly `192 MB` to roughly `94 MB` in the current representative sample workload while keeping text visible
+  - surfaced runtime telemetry in the DX11 and DX12 samples so memory, scratch usage, text-path state, and hot scopes are visible in-library
+- DX12 atlas stability follow-up:
+  - fixed the atlas upload-buffer lifecycle so `CopyTextureRegion` no longer records a zeroed footprint into owned-window command lists
+  - added D3D12 info-queue detail to DX12 command-list reset and close failures so invalid recording state is diagnosable from test output
+  - aligned the DX12 sample, docs, and backend tests around the real mode contract: interop remains the backend default and atlas is an explicit low-memory mode
+  - extended the DX12 backend regression binary to cover both explicit atlas mode and explicit interop mode
 
 ## Current milestone
 

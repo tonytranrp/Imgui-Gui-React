@@ -17,6 +17,7 @@
 #include <d2d1helper.h>
 #include <d3dcompiler.h>
 #include <dwrite.h>
+#include <dxgi.h>
 #include <wrl/client.h>
 
 #include "igr/detail/string_lookup.hpp"
@@ -91,6 +92,12 @@ struct Dx11CompiledShader {
   ComPtr<ID3D11VertexShader> vertex_shader;
   ComPtr<ID3D11PixelShader> pixel_shader;
   ComPtr<ID3D11InputLayout> input_layout;
+};
+
+struct ScopeAccumulator {
+  std::uint64_t call_count{};
+  std::uint64_t total_microseconds{};
+  std::uint64_t max_microseconds{};
 };
 
 D2D1_COLOR_F to_d2d_color(const std::array<float, 4>& color) {
@@ -278,6 +285,122 @@ Status validate_image_descriptor(std::string_view backend_name, const ImageResou
     return Status::invalid_argument(std::string(backend_name) + " image registration requires finite non-negative UV coordinates.");
   }
   return Status::success();
+}
+
+void record_scope(StringMap<ScopeAccumulator>& scopes, std::string_view name, std::uint64_t duration_microseconds) {
+  auto [it, _] = scopes.try_emplace(std::string(name), ScopeAccumulator{});
+  ScopeAccumulator& scope = it->second;
+  scope.call_count += 1;
+  scope.total_microseconds += duration_microseconds;
+  scope.max_microseconds = (std::max)(scope.max_microseconds, duration_microseconds);
+}
+
+std::uint64_t estimate_font_format_bytes(const StringMap<ComPtr<IDWriteTextFormat>>& formats) {
+  return static_cast<std::uint64_t>(formats.size()) * sizeof(IDWriteTextFormat*);
+}
+
+std::uint64_t estimate_wide_text_cache_bytes(const StringMap<std::wstring>& cache) {
+  std::uint64_t total = 0;
+  for (const auto& [key, value] : cache) {
+    total += static_cast<std::uint64_t>(key.capacity());
+    total += static_cast<std::uint64_t>(value.capacity()) * sizeof(wchar_t);
+  }
+  return total;
+}
+
+std::uint64_t estimate_scene_bytes(const Scene& scene) {
+  return static_cast<std::uint64_t>(scene.quads.capacity()) * sizeof(Quad) + static_cast<std::uint64_t>(scene.labels.capacity()) * sizeof(TextLabel);
+}
+
+std::uint64_t estimate_d3d11_buffer_bytes(ID3D11Buffer* buffer) {
+  if (buffer == nullptr) {
+    return 0;
+  }
+  D3D11_BUFFER_DESC desc{};
+  buffer->GetDesc(&desc);
+  return static_cast<std::uint64_t>(desc.ByteWidth);
+}
+
+IDXGIAdapter* resolve_dxgi_adapter(ID3D11Device* device, ComPtr<IDXGIAdapter>& adapter) {
+  if (device == nullptr) {
+    return nullptr;
+  }
+  ComPtr<IDXGIDevice> dxgi_device;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
+    return nullptr;
+  }
+  if (FAILED(dxgi_device->GetAdapter(&adapter))) {
+    return nullptr;
+  }
+  return adapter.Get();
+}
+
+void trim_wide_text_cache(StringMap<std::wstring>& cache, const ResourceBudgetConfig& budgets) {
+  if (budgets.max_cached_wide_strings == 0) {
+    cache.clear();
+    detail::release_storage(cache);
+    return;
+  }
+  if (cache.size() <= budgets.max_cached_wide_strings) {
+    return;
+  }
+  cache.clear();
+  detail::release_storage(cache);
+}
+
+template <typename T>
+void trim_vector_capacity(std::vector<T>& storage, std::size_t max_retained) {
+  if (max_retained == 0) {
+    storage.clear();
+    detail::release_storage(storage);
+    return;
+  }
+  if (storage.capacity() <= max_retained * 2) {
+    return;
+  }
+  std::vector<T> trimmed;
+  trimmed.reserve((std::max)(storage.size(), max_retained));
+  for (auto& item : storage) {
+    trimmed.push_back(std::move(item));
+  }
+  storage.swap(trimmed);
+}
+
+void trim_scratch_storage(Scene& scene,
+                          std::vector<QuadVertex>& vertices,
+                          std::vector<DrawBatch>& batches,
+                          const ResourceBudgetConfig& budgets) {
+  trim_vector_capacity(scene.quads, budgets.max_retained_scene_quads);
+  trim_vector_capacity(scene.labels, budgets.max_retained_text_labels);
+  trim_vector_capacity(vertices, budgets.max_retained_vertices);
+  trim_vector_capacity(batches, budgets.max_retained_batches);
+}
+
+void trim_vertex_buffer(ID3D11DeviceContext* context,
+                        ComPtr<ID3D11Buffer>& vertex_buffer,
+                        std::size_t& vertex_capacity,
+                        std::size_t active_vertex_count,
+                        const ResourceBudgetConfig& budgets) {
+  if (!vertex_buffer) {
+    return;
+  }
+  const std::size_t retained_limit = budgets.max_retained_vertices;
+  if (retained_limit != 0 && active_vertex_count > retained_limit) {
+    return;
+  }
+  const std::size_t oversized_threshold = retained_limit == 0 ? 0 : retained_limit * 2;
+  if (retained_limit != 0 && vertex_capacity <= oversized_threshold) {
+    return;
+  }
+
+  if (context != nullptr) {
+    ID3D11Buffer* null_buffer = nullptr;
+    const UINT stride = 0;
+    const UINT offset = 0;
+    context->IASetVertexBuffers(0, 1, &null_buffer, &stride, &offset);
+  }
+  vertex_buffer.Reset();
+  vertex_capacity = 0;
 }
 
 std::array<float, 4> multiply_color(const std::array<float, 4>& lhs, const std::array<float, 4>& rhs) {
@@ -981,6 +1104,9 @@ class Dx11Backend::Impl {
   StringMap<Dx11CompiledShader> shaders;
   StringMap<ComPtr<ID3D11ShaderResourceView>> textures;
   BackendFrameStats stats{};
+  BackendTelemetrySnapshot telemetry{};
+  StringMap<ScopeAccumulator> scope_totals;
+  std::uint64_t telemetry_refresh_count{};
   std::size_t vertex_capacity{};
   Scene scratch_scene;
   std::vector<QuadVertex> scratch_vertices;
@@ -1489,6 +1615,7 @@ BackendCapabilities Dx11Backend::capabilities() const noexcept {
 }
 
 Status Dx11Backend::initialize() {
+  const auto initialize_started = std::chrono::steady_clock::now();
   if (initialized_) {
     return Status::success();
   }
@@ -1579,6 +1706,12 @@ Status Dx11Backend::initialize() {
   status = rebuild_render_targets(); if (!status) { shutdown(); return status; }
   status = create_pipeline(); if (!status) { shutdown(); return status; }
   initialized_ = true;
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "initialize",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - initialize_started).count()));
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -1597,11 +1730,18 @@ void Dx11Backend::invalidate_back_buffer_resources() noexcept {
 }
 
 Status Dx11Backend::resize(ExtentU viewport) {
+  const auto resize_started = std::chrono::steady_clock::now();
   if (!initialized_) return Status::not_ready("Dx11Backend must be initialized before resize.");
   if (!impl_ || impl_->swap_chain == nullptr || impl_->device == nullptr || impl_->context == nullptr) {
     return Status::not_ready("Dx11Backend cannot resize without an active swap chain, device, and device context.");
   }
   if (same_extent(viewport_, viewport) && impl_->rtv && impl_->d2d_target && impl_->brush) {
+    if (config_.diagnostics.enabled) {
+      record_scope(impl_->scope_totals,
+                   "resize",
+                   static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resize_started).count()));
+      refresh_telemetry();
+    }
     return Status::success();
   }
   viewport_ = viewport;
@@ -1620,10 +1760,18 @@ Status Dx11Backend::resize(ExtentU viewport) {
       return Status::backend_error(device_error_message(impl_->device, "Dx11Backend failed to resize swap chain buffers", hr));
     }
   }
-  return rebuild_render_targets();
+  Status status = rebuild_render_targets();
+  if (status && config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "resize",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - resize_started).count()));
+    refresh_telemetry();
+  }
+  return status;
 }
 
 Status Dx11Backend::render(const FrameDocument& document) {
+  const auto render_started = std::chrono::steady_clock::now();
   if (!initialized_) return Status::not_ready("Dx11Backend must be initialized before render.");
   if (!impl_ || impl_->swap_chain == nullptr || impl_->device == nullptr || impl_->context == nullptr) {
     return Status::not_ready("Dx11Backend cannot render without an active swap chain, device, and device context.");
@@ -1646,6 +1794,11 @@ Status Dx11Backend::render(const FrameDocument& document) {
   if (!texture_status) {
     return texture_status;
   }
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "validate_document",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - render_started).count()));
+  }
 
   const auto build_started = std::chrono::steady_clock::now();
   build_scene(document, config_.theme, impl_->image_resources, impl_->font_descriptors, impl_->wide_text_cache, impl_->scratch_scene);
@@ -1667,8 +1820,11 @@ Status Dx11Backend::render(const FrameDocument& document) {
   }
   impl_->stats.scene_build_microseconds =
       static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - build_started).count());
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals, "scene_build", impl_->stats.scene_build_microseconds);
+  }
 
-  const auto render_started = std::chrono::steady_clock::now();
+  const auto upload_started = std::chrono::steady_clock::now();
   if (!impl_->scratch_vertices.empty()) {
     constexpr std::size_t kMaxVertexCount = static_cast<std::size_t>((std::numeric_limits<UINT>::max)() / sizeof(QuadVertex));
     if (impl_->scratch_vertices.size() > kMaxVertexCount) {
@@ -1697,7 +1853,13 @@ Status Dx11Backend::render(const FrameDocument& document) {
     std::memcpy(mapped.pData, impl_->scratch_vertices.data(), impl_->scratch_vertices.size() * sizeof(QuadVertex));
     impl_->context->Unmap(impl_->vertex_buffer.Get(), 0);
   }
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "vertex_upload",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - upload_started).count()));
+  }
 
+  const auto submit_started = std::chrono::steady_clock::now();
   const float blend[4] = {0, 0, 0, 0};
   const D3D11_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(viewport_.width), static_cast<float>(viewport_.height), 0.0f, 1.0f};
   impl_->context->OMSetRenderTargets(1, impl_->rtv.GetAddressOf(), nullptr);
@@ -1836,11 +1998,19 @@ Status Dx11Backend::render(const FrameDocument& document) {
     return Status::backend_error("Dx11Backend Direct2D text pass failed: " + hex_hr(draw_hr));
   }
   impl_->stats.render_submit_microseconds =
-      static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - render_started).count());
+      static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submit_started).count());
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals, "render_submit", impl_->stats.render_submit_microseconds);
+  }
+  trim_wide_text_cache(impl_->wide_text_cache, config_.resource_budgets);
+  trim_scratch_storage(impl_->scratch_scene, impl_->scratch_vertices, impl_->scratch_batches, config_.resource_budgets);
+  trim_vertex_buffer(impl_->context, impl_->vertex_buffer, impl_->vertex_capacity, impl_->scratch_vertices.size(), config_.resource_budgets);
+  refresh_telemetry();
   return Status::success();
 }
 
 Status Dx11Backend::present() {
+  const auto present_started = std::chrono::steady_clock::now();
   if (!initialized_) return Status::not_ready("Dx11Backend must be initialized before present.");
   if (config_.host.presentation_mode == PresentationMode::host_managed) {
     return Status::success();
@@ -1851,6 +2021,12 @@ Status Dx11Backend::present() {
   const HRESULT hr = impl_->swap_chain->Present(config_.enable_vsync ? 1u : 0u, 0u);
   if (hr == DXGI_STATUS_OCCLUDED || hr == DXGI_STATUS_MODE_CHANGE_IN_PROGRESS) return Status::success();
   if (FAILED(hr)) return Status::backend_error(device_error_message(impl_->device, "Dx11Backend failed to present the swap chain", hr));
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "present",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - present_started).count()));
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -1858,7 +2034,81 @@ BackendFrameStats Dx11Backend::frame_stats() const noexcept {
   return impl_ ? impl_->stats : BackendFrameStats{};
 }
 
+BackendTelemetrySnapshot Dx11Backend::telemetry() const noexcept {
+  return impl_ ? impl_->telemetry : BackendTelemetrySnapshot{};
+}
+
+void Dx11Backend::refresh_telemetry() noexcept {
+  if (!impl_) {
+    return;
+  }
+
+  impl_->telemetry.frame = impl_->stats;
+  if (!config_.diagnostics.enabled) {
+    impl_->telemetry_refresh_count = 0;
+    impl_->telemetry.process_memory = {};
+    impl_->telemetry.gpu_memory = {};
+    impl_->telemetry.resources = {};
+    impl_->telemetry.scopes.clear();
+    return;
+  }
+
+  ++impl_->telemetry_refresh_count;
+  const std::uint32_t memory_interval = (std::max)(1u, config_.diagnostics.memory_sample_interval);
+  const bool sample_memory = impl_->telemetry_refresh_count == 1 || (impl_->telemetry_refresh_count % memory_interval) == 0;
+
+  if (config_.diagnostics.collect_process_memory && sample_memory) {
+    impl_->telemetry.process_memory = query_process_memory();
+  }
+  if (config_.diagnostics.collect_gpu_memory && sample_memory) {
+    ComPtr<IDXGIAdapter> adapter;
+    impl_->telemetry.gpu_memory = query_gpu_memory(resolve_dxgi_adapter(impl_->device, adapter));
+  }
+
+  if (config_.diagnostics.collect_resource_usage) {
+    ResourceUsageSnapshot resources{};
+    resources.font_count = impl_->font_descriptors.size();
+    resources.image_count = impl_->image_resources.size();
+    resources.shader_count = impl_->shader_descriptors.size();
+    resources.texture_count = impl_->textures.size();
+    resources.font_cache_bytes = estimate_font_format_bytes(impl_->font_formats);
+    resources.wide_text_cache_bytes = estimate_wide_text_cache_bytes(impl_->wide_text_cache);
+    resources.scene_bytes = estimate_scene_bytes(impl_->scratch_scene);
+    resources.scratch_vertex_bytes = static_cast<std::uint64_t>(impl_->scratch_vertices.capacity()) * sizeof(QuadVertex);
+    resources.scratch_batch_bytes = static_cast<std::uint64_t>(impl_->scratch_batches.capacity()) * sizeof(DrawBatch);
+    resources.gpu_vertex_buffer_bytes = estimate_d3d11_buffer_bytes(impl_->vertex_buffer.Get());
+    resources.gpu_constant_buffer_bytes = estimate_d3d11_buffer_bytes(impl_->shader_constant_buffer.Get());
+    resources.total_estimated_bytes = resources.font_cache_bytes + resources.wide_text_cache_bytes + resources.scene_bytes +
+                                      resources.scratch_vertex_bytes + resources.scratch_batch_bytes +
+                                      resources.gpu_vertex_buffer_bytes + resources.gpu_constant_buffer_bytes;
+    impl_->telemetry.resources = resources;
+  }
+
+  if (config_.diagnostics.collect_scope_timings) {
+    impl_->telemetry.scopes.clear();
+    impl_->telemetry.scopes.reserve(impl_->scope_totals.size());
+    for (const auto& [name, totals] : impl_->scope_totals) {
+      impl_->telemetry.scopes.push_back({
+          .name = name,
+          .call_count = totals.call_count,
+          .total_microseconds = totals.total_microseconds,
+          .max_microseconds = totals.max_microseconds,
+      });
+    }
+    std::sort(impl_->telemetry.scopes.begin(), impl_->telemetry.scopes.end(), [](const ScopeTelemetry& lhs, const ScopeTelemetry& rhs) {
+      if (lhs.total_microseconds == rhs.total_microseconds) {
+        return lhs.name < rhs.name;
+      }
+      return lhs.total_microseconds > rhs.total_microseconds;
+    });
+    if (impl_->telemetry.scopes.size() > config_.diagnostics.top_scope_limit) {
+      impl_->telemetry.scopes.resize(config_.diagnostics.top_scope_limit);
+    }
+  }
+}
+
 Status Dx11Backend::register_font(std::string_view key, const FontResourceDesc& descriptor) {
+  const auto started = std::chrono::steady_clock::now();
   if (key.empty()) {
     return Status::invalid_argument("Dx11Backend font registration requires a non-empty key.");
   }
@@ -1868,7 +2118,14 @@ Status Dx11Backend::register_font(std::string_view key, const FontResourceDesc& 
   }
   impl_->font_descriptors[std::string(key)] = descriptor;
   impl_->font_formats.erase(std::string(key));
-  return realize_registered_fonts();
+  Status status = realize_registered_fonts();
+  if (status && config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "register_font",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+    refresh_telemetry();
+  }
+  return status;
 }
 
 void Dx11Backend::unregister_font(std::string_view key) noexcept {
@@ -1877,9 +2134,11 @@ void Dx11Backend::unregister_font(std::string_view key) noexcept {
   }
   impl_->font_descriptors.erase(std::string(key));
   impl_->font_formats.erase(std::string(key));
+  refresh_telemetry();
 }
 
 Status Dx11Backend::register_image(std::string_view key, const ImageResourceDesc& descriptor) {
+  const auto started = std::chrono::steady_clock::now();
   if (key.empty()) {
     return Status::invalid_argument("Dx11Backend image registration requires a non-empty key.");
   }
@@ -1888,6 +2147,12 @@ Status Dx11Backend::register_image(std::string_view key, const ImageResourceDesc
     return validation_status;
   }
   impl_->image_resources[std::string(key)] = descriptor;
+  if (config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "register_image",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -1896,9 +2161,11 @@ void Dx11Backend::unregister_image(std::string_view key) noexcept {
     return;
   }
   impl_->image_resources.erase(std::string(key));
+  refresh_telemetry();
 }
 
 Status Dx11Backend::register_shader(std::string_view key, const ShaderResourceDesc& descriptor) {
+  const auto started = std::chrono::steady_clock::now();
   if (key.empty()) {
     return Status::invalid_argument("Dx11Backend shader registration requires a non-empty key.");
   }
@@ -1907,7 +2174,14 @@ Status Dx11Backend::register_shader(std::string_view key, const ShaderResourceDe
   }
   impl_->shader_descriptors[std::string(key)] = descriptor;
   impl_->shaders.erase(std::string(key));
-  return realize_registered_shaders();
+  Status status = realize_registered_shaders();
+  if (status && config_.diagnostics.enabled) {
+    record_scope(impl_->scope_totals,
+                 "register_shader",
+                 static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
+    refresh_telemetry();
+  }
+  return status;
 }
 
 void Dx11Backend::unregister_shader(std::string_view key) noexcept {
@@ -1916,6 +2190,7 @@ void Dx11Backend::unregister_shader(std::string_view key) noexcept {
   }
   impl_->shader_descriptors.erase(std::string(key));
   impl_->shaders.erase(std::string(key));
+  refresh_telemetry();
 }
 
 Status Dx11Backend::register_texture(std::string_view key, const Dx11TextureBinding& binding) {
@@ -1949,6 +2224,9 @@ Status Dx11Backend::register_texture(std::string_view key, const Dx11TextureBind
   texture_view.Attach(binding.shader_resource_view);
   texture_view.Get()->AddRef();
   impl_->textures[std::string(key)] = std::move(texture_view);
+  if (config_.diagnostics.enabled) {
+    refresh_telemetry();
+  }
   return Status::success();
 }
 
@@ -1961,6 +2239,7 @@ void Dx11Backend::unregister_texture(std::string_view key) noexcept {
     return;
   }
   impl_->textures.erase(std::string(key));
+  refresh_telemetry();
 }
 
 Status Dx11Backend::rebind_host(const Dx11HostBinding& binding) {
@@ -2083,6 +2362,8 @@ void Dx11Backend::shutdown() noexcept {
     impl_->swap_chain = nullptr; impl_->context = nullptr; impl_->device = nullptr;
     impl_->owned_swap_chain.Reset(); impl_->owned_context.Reset(); impl_->owned_device.Reset(); impl_->vertex_capacity = 0;
     impl_->stats = {};
+    impl_->telemetry = {};
+    impl_->telemetry_refresh_count = 0;
   }
   viewport_ = {}; last_widget_count_ = 0; feature_level_ = D3D_FEATURE_LEVEL_11_0; initialized_ = false; owns_device_objects_ = false;
 }

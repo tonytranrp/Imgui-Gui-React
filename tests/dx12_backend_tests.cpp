@@ -191,6 +191,24 @@ igr::FrameDocument build_document(std::uint64_t frame_index, igr::ExtentU viewpo
 
 }
 
+igr::FrameDocument build_text_only_document(std::uint64_t frame_index, igr::ExtentU viewport) {
+  igr::UiContext context;
+  context.begin_frame({
+      .frame_index = frame_index,
+      .viewport = viewport,
+      .delta_seconds = 1.0 / 60.0,
+  });
+
+  auto& builder = context.builder();
+  builder.begin_window("dx12-text-only", "DX12 Text Path", {{24.0f, 24.0f}, {280.0f, 160.0f}});
+  builder.begin_stack("text-layout", igr::Axis::vertical);
+  builder.text("headline", "interop validation", "body-md");
+  builder.text("body", "The DX12 backend should keep the DirectWrite interop path alive when atlas mode is disabled.", "body-md");
+  builder.end_container();
+  builder.end_container();
+  return context.end_frame();
+}
+
 
 
 }  // namespace
@@ -264,6 +282,12 @@ int main() {
 
 
   igr::backends::Dx12Backend backend({
+      .diagnostics = {
+          .memory_sample_interval = 8,
+      },
+      .resource_budgets = {
+          .max_cached_wide_strings = 0,
+      },
 
       .window_handle = window_handle,
 
@@ -272,6 +296,7 @@ int main() {
       .enable_debug_layer = true,
 
       .enable_vsync = false,
+      .text_renderer = igr::backends::Dx12TextRendererMode::atlas,
 
   });
 
@@ -586,6 +611,23 @@ int main() {
 
   }
 
+  const auto initial_telemetry = backend.telemetry();
+
+  if (initial_telemetry.frame.widget_count != document.widget_count() || initial_telemetry.resources.font_count == 0 ||
+      initial_telemetry.resources.image_count == 0 || initial_telemetry.resources.shader_count == 0 ||
+      initial_telemetry.resources.texture_count == 0 || initial_telemetry.resources.wide_text_cache_bytes != 0 ||
+      !initial_telemetry.resources.text_atlas_active || initial_telemetry.scopes.empty()) {
+
+    backend.shutdown();
+
+    DestroyWindow(window_handle);
+
+    UnregisterClassW(class_name, instance);
+
+    return fail("DX12 backend telemetry did not capture the expected resource or scope diagnostics");
+
+  }
+
 
 
   status = backend.resize({480, 320});
@@ -729,6 +771,68 @@ int main() {
 
 
   backend.shutdown();
+
+  igr::backends::Dx12Backend interop_backend({
+      .window_handle = window_handle,
+      .initial_viewport = {320, 240},
+      .enable_debug_layer = true,
+      .enable_vsync = false,
+      .text_renderer = igr::backends::Dx12TextRendererMode::interop,
+  });
+
+  status = interop_backend.initialize();
+  if (!status) {
+    std::cerr << status.message() << '\n';
+    DestroyWindow(window_handle);
+    UnregisterClassW(class_name, instance);
+    return fail("DX12 backend interop initialization failed");
+  }
+
+  status = interop_backend.register_font("body-md", {
+      .family = "Segoe UI",
+      .size = 16.0f,
+      .weight = igr::FontWeight::medium,
+      .style = igr::FontStyle::normal,
+      .locale = "en-us",
+  });
+  if (!status) {
+    std::cerr << status.message() << '\n';
+    interop_backend.shutdown();
+    DestroyWindow(window_handle);
+    UnregisterClassW(class_name, instance);
+    return fail("DX12 backend interop font registration failed");
+  }
+
+  const igr::FrameDocument interop_document = build_text_only_document(3, {320, 240});
+  status = interop_backend.render(interop_document);
+  if (!status) {
+    std::cerr << status.message() << '\n';
+    interop_backend.shutdown();
+    DestroyWindow(window_handle);
+    UnregisterClassW(class_name, instance);
+    return fail("DX12 backend interop render failed");
+  }
+
+  status = interop_backend.present();
+  if (!status) {
+    std::cerr << status.message() << '\n';
+    interop_backend.shutdown();
+    DestroyWindow(window_handle);
+    UnregisterClassW(class_name, instance);
+    return fail("DX12 backend interop present failed");
+  }
+
+  const auto interop_telemetry = interop_backend.telemetry();
+  if (interop_telemetry.frame.widget_count != interop_document.widget_count() ||
+      interop_telemetry.resources.text_atlas_active ||
+      !interop_telemetry.resources.text_interop_active) {
+    interop_backend.shutdown();
+    DestroyWindow(window_handle);
+    UnregisterClassW(class_name, instance);
+    return fail("DX12 backend interop telemetry did not report the expected text path");
+  }
+
+  interop_backend.shutdown();
 
   DestroyWindow(window_handle);
 

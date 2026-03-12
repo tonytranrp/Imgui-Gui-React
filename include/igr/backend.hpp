@@ -2,6 +2,7 @@
 
 #include <string_view>
 
+#include "igr/diagnostics.hpp"
 #include "igr/frame.hpp"
 #include "igr/geometry.hpp"
 #include "igr/host.hpp"
@@ -29,6 +30,14 @@ struct BackendFrameStats {
   std::uint64_t render_submit_microseconds{};
 };
 
+struct BackendTelemetrySnapshot {
+  BackendFrameStats frame{};
+  ProcessMemorySnapshot process_memory{};
+  GpuMemorySnapshot gpu_memory{};
+  ResourceUsageSnapshot resources{};
+  std::vector<ScopeTelemetry> scopes;
+};
+
 struct BackendCapabilities {
   bool debug_layer{};
   bool user_textures{};
@@ -54,6 +63,7 @@ class IRendererBackend {
   virtual Status render(const FrameDocument& document) = 0;
   virtual Status present() = 0;
   [[nodiscard]] virtual BackendFrameStats frame_stats() const noexcept = 0;
+  [[nodiscard]] virtual BackendTelemetrySnapshot telemetry() const noexcept = 0;
   virtual void shutdown() noexcept = 0;
 };
 

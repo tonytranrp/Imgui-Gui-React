@@ -46,5 +46,7 @@ Status parse_transport_envelope(std::string_view payload, TransportEnvelope* env
 Status serialize_transport_envelope(const TransportEnvelope& envelope, std::string* payload);
 Status materialize_transport_envelope(const TransportEnvelope& envelope, FrameBuilder& builder);
 Status materialize_transport_envelope(std::string_view payload, FrameBuilder& builder);
+Status apply_transport_resources(const TransportEnvelope& envelope, IResourceRegistry& registry);
+Status reconcile_transport_resources(const TransportEnvelope& previous, const TransportEnvelope& current, IResourceRegistry& registry);
 
 }  // namespace igr::react

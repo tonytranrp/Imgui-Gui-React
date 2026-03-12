@@ -5,7 +5,7 @@
 IGR UI is split into five layers:
 
 1. `igr_core`
-   Immediate-mode primitives, frame lifecycle, widget modeling, diagnostics, and deterministic IDs.
+   Immediate-mode primitives, frame lifecycle, widget modeling, diagnostics, resource budgets, and deterministic IDs.
 2. `igr_backend_dx11`
    DirectX 11 renderer integration and lifecycle management.
 3. `igr_backend_dx12`
@@ -63,6 +63,16 @@ The current v1 shader contract is intentionally constrained:
 
 That gives the library a stable public shader surface without pretending DX11 and DX12 have identical internal resource models.
 
+## Diagnostics and budgets
+
+The native runtime now exposes a shared telemetry surface and shared resource-budget controls across DX11 and DX12.
+
+- `DiagnosticsConfig` controls process-memory sampling, GPU-memory sampling, scope timing capture, and telemetry cadence.
+- `ResourceBudgetConfig` controls retained wide-string cache size plus retained scratch scene, vertex, batch, and shader-constant capacity.
+- Both backends expose `telemetry()` so native hosts, samples, and higher-level bridge code can inspect live resource pressure without coupling to renderer internals.
+
+The key architectural rule is that diagnostics stay observational and budgets stay explicit. The renderer should not hide expensive retention behind undocumented heuristics when the user wants a lower-memory configuration.
+
 ## Host models
 
 The repository now treats backend hosting as a first-class architecture concern:
@@ -106,7 +116,7 @@ Status: implemented. The DX11 backend now owns a live D3D11 plus Direct2D/Direct
 - resize and synchronization correctness
 - host-managed and injected-overlay API support from the start
 
-Status: implemented. The DX12 backend now supports owned-window rendering, host-managed per-frame binding through `Dx12FrameBinding`, descriptor-backed textures, explicit barriers, upload-buffer drawing, and runtime validation through both sample and test binaries.
+Status: implemented. The DX12 backend now supports owned-window rendering, host-managed per-frame binding through `Dx12FrameBinding`, descriptor-backed textures, explicit barriers, upload-buffer drawing, and runtime validation through both sample and test binaries. The current default text path is atlas-backed, with the older interop path retained as an explicit mode for compatibility and validation.
 
 ### Phase 4: JS and package integration
 

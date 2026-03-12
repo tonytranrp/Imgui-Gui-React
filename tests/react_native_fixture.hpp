@@ -16,27 +16,12 @@
 #include "igr/react/transport.hpp"
 
 namespace igr::tests {
-namespace {
-
-template <typename Backend>
-Status register_transport_shaders_if_supported(const react::TransportEnvelope& envelope, Backend& backend) {
-  if constexpr (requires(Backend& candidate, const std::string& key, const ShaderResourceDesc& descriptor) {
-                  { candidate.register_shader(key, descriptor) } -> std::same_as<Status>;
-                }) {
-    for (const auto& shader : envelope.shaders) {
-      Status status = backend.register_shader(shader.key, shader.descriptor);
-      if (!status) {
-        return status;
-      }
-    }
-  }
-  return Status::success();
-}
-
-}  // namespace
-
 inline std::filesystem::path react_native_fixture_path() {
   return std::filesystem::path(IGR_PROJECT_SOURCE_DIR) / "tests" / "fixtures" / "react-native-test.physics.json";
+}
+
+inline std::filesystem::path generated_react_native_fixture_path() {
+  return std::filesystem::path(IGR_PROJECT_SOURCE_DIR) / "npm" / "apps" / "react-native-test" / "dist" / "react-native-test.physics.json";
 }
 
 inline std::filesystem::path react_native_bundle_path() {
@@ -87,7 +72,10 @@ inline Status load_react_native_fixture(FrameInfo info, react::TransportEnvelope
   }
 
   std::string local_payload;
-  Status status = read_text_file(react_native_fixture_path(), &local_payload);
+  const std::filesystem::path preferred_path = std::filesystem::exists(generated_react_native_fixture_path())
+                                                   ? generated_react_native_fixture_path()
+                                                   : react_native_fixture_path();
+  Status status = read_text_file(preferred_path, &local_payload);
   if (!status) {
     return status;
   }
@@ -149,35 +137,11 @@ inline Status load_react_native_scene(FrameInfo info, react::TransportEnvelope* 
 }
 
 inline Status register_transport_resources(const react::TransportEnvelope& envelope, backends::Dx11Backend& backend) {
-  for (const auto& font : envelope.fonts) {
-    Status status = backend.register_font(font.key, font.descriptor);
-    if (!status) {
-      return status;
-    }
-  }
-  for (const auto& image : envelope.images) {
-    Status status = backend.register_image(image.key, image.descriptor);
-    if (!status) {
-      return status;
-    }
-  }
-  return register_transport_shaders_if_supported(envelope, backend);
+  return react::apply_transport_resources(envelope, backend);
 }
 
 inline Status register_transport_resources(const react::TransportEnvelope& envelope, backends::Dx12Backend& backend) {
-  for (const auto& font : envelope.fonts) {
-    Status status = backend.register_font(font.key, font.descriptor);
-    if (!status) {
-      return status;
-    }
-  }
-  for (const auto& image : envelope.images) {
-    Status status = backend.register_image(image.key, image.descriptor);
-    if (!status) {
-      return status;
-    }
-  }
-  return register_transport_shaders_if_supported(envelope, backend);
+  return react::apply_transport_resources(envelope, backend);
 }
 
 }  // namespace igr::tests

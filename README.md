@@ -11,14 +11,14 @@ The repository now contains the production foundation:
 - a buildable C++ core with deterministic frame and widget modeling
 - a live DirectX 11 backend with real device, swap chain, resize, render, present, theme, DirectWrite text, user-texture image paths, and custom draw primitives
 - manual host-binding support for DX11, including host-managed present and resize flows, clip-rect scissoring, and overlay-safe no-clear composition
-- a live DirectX 12 backend with owned-window rendering, DirectWrite text through D3D11On12 interop, host-managed frame binding, descriptor-backed textures, custom draw primitives, and runtime validation for injected and external-host usage
+- a live DirectX 12 backend with owned-window rendering, a conservative D3D11On12 text path by default plus an opt-in lower-memory software text atlas, host-managed frame binding, descriptor-backed textures, custom draw primitives, and runtime validation for injected and external-host usage
 - a shared shader system for DX11 and DX12 with HLSL and GLSL support, `shader_rect` and `shader_image` widgets, runtime compilation, and React/transport authoring support
 - a shared overlay-input evaluation utility for injected/manual-host integrations
 - a declarative materializer that maps React-style element trees onto the immediate-mode core
 - a packaged Hermes runtime host that executes React-authored TSX scene bundles and materializes their transport payload into native frames
 - native tests, a foundation example, a live Win32 DX11 sample, CI workflow, build scripts, and architecture docs
 
-Both native backends now share the same document-driven widget set, resource registries, overlay input evaluation, host rebind and detach flows, backend frame stats, and a transport-backed JS bridge envelope. The Hermes bridge now runs in-process through the packaged Microsoft.JavaScript.Hermes runtime, with the TSX workspace app generating the same payloads that the external-host DX11 and DX12 tests consume. The remaining major work is bidirectional JS/native events, richer atlas management for host-managed overlays, deeper performance instrumentation, and broader extension/plugin coverage.
+Both native backends now share the same document-driven widget set, resource registries, overlay input evaluation, host rebind and detach flows, backend frame stats, and a transport-backed JS bridge envelope. The Hermes bridge now runs in-process through the packaged Microsoft.JavaScript.Hermes runtime, with the TSX workspace app generating the same payloads that the external-host DX11 and DX12 tests consume. The remaining major work is bidirectional JS/native events, richer host-managed atlas integration when the host owns descriptor heaps, deeper performance instrumentation, and broader extension/plugin coverage.
 
 ## Repository layout
 

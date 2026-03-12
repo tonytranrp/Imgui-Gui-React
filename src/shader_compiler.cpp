@@ -8,25 +8,17 @@
 #include <vector>
 
 #include <d3dcompiler.h>
+#if IGR_ENABLE_GLSL_SHADERS
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
 #include <spirv_hlsl.hpp>
+#endif
 #include <wrl/client.h>
 
 namespace igr::shaders {
 namespace {
 
 using Microsoft::WRL::ComPtr;
-
-struct GlslangProcess {
-  GlslangProcess() { glslang_initialize_process(); }
-  ~GlslangProcess() { glslang_finalize_process(); }
-};
-
-const GlslangProcess& glslang_process() {
-  static const GlslangProcess process;
-  return process;
-}
 
 std::string shader_stage_name(ProgramStage stage) {
   return stage == ProgramStage::vertex ? "vertex" : "pixel";
@@ -38,12 +30,23 @@ std::string hex_hr(HRESULT hr) {
   return stream.str();
 }
 
-glslang_stage_t to_glslang_stage(ProgramStage stage) noexcept {
-  return stage == ProgramStage::vertex ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT;
-}
-
 const char* to_profile(ProgramStage stage) noexcept {
   return stage == ProgramStage::vertex ? "vs_5_0" : "ps_5_0";
+}
+
+#if IGR_ENABLE_GLSL_SHADERS
+struct GlslangProcess {
+  GlslangProcess() { glslang_initialize_process(); }
+  ~GlslangProcess() { glslang_finalize_process(); }
+};
+
+const GlslangProcess& glslang_process() {
+  static const GlslangProcess process;
+  return process;
+}
+
+glslang_stage_t to_glslang_stage(ProgramStage stage) noexcept {
+  return stage == ProgramStage::vertex ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT;
 }
 
 const char* info_or_empty(const char* value) noexcept {
@@ -145,6 +148,7 @@ Status translate_glsl_to_hlsl(const ShaderStageDesc& descriptor, ProgramStage st
 
   return Status::success();
 }
+#endif
 
 Status stage_to_hlsl(const ShaderStageDesc& descriptor, ProgramStage stage, std::string* output) {
   if (output == nullptr) {
@@ -158,7 +162,12 @@ Status stage_to_hlsl(const ShaderStageDesc& descriptor, ProgramStage stage, std:
     *output = descriptor.source;
     return Status::success();
   }
+#if IGR_ENABLE_GLSL_SHADERS
   return translate_glsl_to_hlsl(descriptor, stage, output);
+#else
+  (void)stage;
+  return Status::invalid_argument("GLSL shader support was disabled for this build.");
+#endif
 }
 
 Status compile_hlsl(const ShaderStageDesc& descriptor,

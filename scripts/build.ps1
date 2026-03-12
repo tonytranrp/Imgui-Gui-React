@@ -1,6 +1,8 @@
 param(
   [ValidateSet("Debug", "Release")]
-  [string]$Configuration = "Debug"
+  [string]$Configuration = "Debug",
+  [string]$BuildDirName,
+  [switch]$EnableGlslShaders
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,18 +20,37 @@ if ($null -eq $vsInfo) {
 }
 
 $vsDevCmd = Join-Path $vsInfo.installationPath "Common7\Tools\VsDevCmd.bat"
-$buildDirName = if ($Configuration -eq "Debug") { "b" } else { "b-release" }
+$buildDirName = if ([string]::IsNullOrWhiteSpace($BuildDirName)) {
+  if ($Configuration -eq "Debug") { "b" } else { "b-release" }
+} else {
+  $BuildDirName
+}
 $buildDir = Join-Path $repoRoot $buildDirName
+$glslOption = if ($EnableGlslShaders.IsPresent) { "ON" } else { "OFF" }
 
 if (Test-Path $buildDir) {
-  Get-ChildItem -Path $buildDir -Force |
-    Where-Object { $_.Name -ne "Testing" } |
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+  foreach ($entry in Get-ChildItem -Path $buildDir -Force | Where-Object { $_.Name -ne "Testing" }) {
+    try {
+      Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction Stop
+    } catch {
+      Start-Sleep -Milliseconds 150
+      try {
+        Remove-Item -LiteralPath $entry.FullName -Recurse -Force -ErrorAction Stop
+      } catch {
+        if ((Test-Path -LiteralPath $entry.FullName) -and
+            ($entry.Name -notlike "*.obj.d") -and
+            ($entry.Name -notlike "*.obj") -and
+            ($entry.Name -ne "CMakeFiles")) {
+          throw
+        }
+      }
+    }
+  }
 }
 
 $cmd = @(
   "call `"$vsDevCmd`" -arch=x64",
-  "cmake -S `"$repoRoot`" -B `"$buildDir`" -G `"NMake Makefiles`" -DCMAKE_BUILD_TYPE=$Configuration -DIGR_ENABLE_HERMES=ON",
+  "cmake -S `"$repoRoot`" -B `"$buildDir`" -G `"NMake Makefiles`" -DCMAKE_BUILD_TYPE=$Configuration -DIGR_ENABLE_HERMES=ON -DIGR_ENABLE_GLSL_SHADERS=$glslOption",
   "cmake --build `"$buildDir`""
 ) -join " && "
 
