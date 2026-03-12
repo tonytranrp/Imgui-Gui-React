@@ -1,0 +1,42 @@
+name: windows
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: npm/package-lock.json
+
+      - name: Configure native build
+        run: cmake -S . -B build/ci -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build native targets
+        run: cmake --build build/ci
+
+      - name: Run native tests
+        run: ctest --test-dir build/ci --output-on-failure
+
+      - name: Install npm dependencies
+        working-directory: npm
+        run: npm ci
+
+      - name: Run npm tests
+        working-directory: npm
+        run: npm test

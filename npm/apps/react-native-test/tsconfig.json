@@ -1,0 +1,15 @@
+{
+  "extends": "../../../typescript/tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@igr/react"
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx"
+  ]
+}

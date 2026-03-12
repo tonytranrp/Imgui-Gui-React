@@ -1,0 +1,24 @@
+{
+  "extends": "../../../typescript/tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@igr/react",
+    "baseUrl": ".",
+    "paths": {
+      "@igr/react": [
+        "./src/index.ts"
+      ],
+      "@igr/react/jsx-runtime": [
+        "./src/jsx-runtime.ts"
+      ]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.tsx",
+    "test/**/*.ts",
+    "test/**/*.tsx"
+  ]
+}

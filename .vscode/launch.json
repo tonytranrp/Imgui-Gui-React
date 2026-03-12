@@ -1,0 +1,51 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C++: Foundation Sample",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/b/igr_foundation_sample.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "C++: Win32 DX11 Sample",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/b/igr_win32_dx11_sample.exe",
+      "args": [
+        "--frames",
+        "120"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "C++: Win32 DX12 Sample",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/b/igr_win32_dx12_sample.exe",
+      "args": [
+        "--frames",
+        "120"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    },
+    {
+      "name": "C++: DX12 Contract Test",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/b/igr_dx12_contract_tests.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopAtEntry": false
+    }
+  ]
+}

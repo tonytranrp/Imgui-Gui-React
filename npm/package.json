@@ -1,0 +1,21 @@
+{
+  "name": "igr-ui-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/core",
+    "packages/react",
+    "apps/react-native-test"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "export:fixtures": "node ./tools/export-fixtures.mjs",
+    "hermes:bundle": "node ./tools/build-hermes-bundle.mjs",
+    "test": "npm run build && npm run export:fixtures && node ./tools/run-tests.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "esbuild": "^0.25.10",
+    "typescript": "^5.9.3"
+  }
+}
